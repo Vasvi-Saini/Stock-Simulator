@@ -1,0 +1,107 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+      start_period: 2s
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - backend/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MARKET_WORKER_URL=http://market-worker:8085
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - "8080:8080"
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  market-worker:
+    build:
+      context: ./python-services/market-worker
+    env_file:
+      - backend/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - QUOTE_SERVER_HOST=0.0.0.0
+      - QUOTE_SERVER_PORT=8085
+      - SYMBOL_ALIASES_FILE=/app/symbol_aliases.json
+      - MARKET_STATUS_URL=http://backend:8080/api/v1/market/status
+    volumes:
+      - ./python-services/market-worker/symbol_aliases.json:/app/symbol_aliases.json:ro
+    expose:
+      - "8085"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  news-worker:
+    build:
+      context: ./python-services/news-worker
+    env_file:
+      - backend/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8080/api/v1
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8080/ws/market
+    restart: on-failure
+    depends_on:
+      - backend
+
+  # The local PostgreSQL container is only started when explicitly requested via:
+  #   docker compose --profile local-db up
+  # By default, the stack connects seamlessly to Neon DEV PostgreSQL.
+  db:
+    profiles: ["local-db"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: stock_simulator
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d stock_simulator"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  redis_data:

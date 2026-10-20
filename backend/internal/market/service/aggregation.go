@@ -1,0 +1,545 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/cache"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/alias"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/dto"
+	"github.com/redis/go-redis/v9"
+)
+
+// EquityUniverseItem represents an equity instrument considered for market aggregation.
+type EquityUniverseItem struct {
+	Symbol   string `json:"symbol"`
+	Name     string `json:"name"`
+	Exchange string `json:"exchange"`
+}
+
+// DefaultEquityUniverse represents the benchmark institutional equities evaluated when
+// running in standalone or initial-bootstrap environments without a populated database.
+var DefaultEquityUniverse = []EquityUniverseItem{
+	{Symbol: "RELIANCE", Name: "Reliance Industries", Exchange: "NSE"},
+	{Symbol: "TCS", Name: "Tata Consultancy Services", Exchange: "NSE"},
+	{Symbol: "INFY", Name: "Infosys Ltd", Exchange: "NSE"},
+	{Symbol: "HDFCBANK", Name: "HDFC Bank Ltd", Exchange: "NSE"},
+	{Symbol: "TATAMOTORS", Name: "Tata Motors Ltd", Exchange: "NSE"},
+	{Symbol: "BHARTIARTL", Name: "Bharti Airtel Ltd", Exchange: "NSE"},
+	{Symbol: "ETERNAL", Name: "Eternal (formerly Zomato)", Exchange: "NSE"},
+	{Symbol: "SUZLON", Name: "Suzlon Energy Ltd", Exchange: "NSE"},
+	{Symbol: "TRENT", Name: "Trent Ltd", Exchange: "NSE"},
+	{Symbol: "ADANIENT", Name: "Adani Enterprises Ltd", Exchange: "NSE"},
+	{Symbol: "YESBANK", Name: "Yes Bank Ltd", Exchange: "NSE"},
+	{Symbol: "BEL", Name: "Bharat Electronics Ltd", Exchange: "NSE"},
+	{Symbol: "SBIN", Name: "State Bank of India", Exchange: "NSE"},
+	{Symbol: "ICICIBANK", Name: "ICICI Bank Ltd", Exchange: "NSE"},
+	{Symbol: "ATGL", Name: "Adani Total Gas Ltd", Exchange: "NSE"},
+	{Symbol: "POONAWALLA", Name: "Poonawalla Fincorp", Exchange: "NSE"},
+	{Symbol: "TATACHEM", Name: "Tata Chemicals Ltd", Exchange: "NSE"},
+	{Symbol: "TATAPOWER", Name: "Tata Power Co Ltd", Exchange: "NSE"},
+	{Symbol: "PRAJIND", Name: "Praj Industries Ltd", Exchange: "NSE"},
+	{Symbol: "BAJFINANCE", Name: "Bajaj Finance Ltd", Exchange: "NSE"},
+	{Symbol: "AXISBANK", Name: "Axis Bank Ltd", Exchange: "NSE"},
+	{Symbol: "KOTAKBANK", Name: "Kotak Mahindra Bank", Exchange: "NSE"},
+	{Symbol: "APARINDS", Name: "Apar Industries Ltd", Exchange: "NSE"},
+	{Symbol: "MARUTI", Name: "Maruti Suzuki India", Exchange: "NSE"},
+}
+
+// GetEquityUniverse resolves the active equity universe from a custom provider,
+// the canonical instruments database table, or DefaultEquityUniverse as a fallback.
+func (s *Service) GetEquityUniverse(ctx context.Context) ([]EquityUniverseItem, error) {
+	if s == nil {
+		return DefaultEquityUniverse, nil
+	}
+
+	s.equityUniverseMu.RLock()
+	if s.equityUniverseCache != nil && time.Now().Before(s.equityUniverseExpiry) {
+		cached := s.equityUniverseCache
+		s.equityUniverseMu.RUnlock()
+		return cached, nil
+	}
+	s.equityUniverseMu.RUnlock()
+
+	s.equityUniverseMu.Lock()
+	defer s.equityUniverseMu.Unlock()
+
+	// Double check cache under write lock
+	if s.equityUniverseCache != nil && time.Now().Before(s.equityUniverseExpiry) {
+		return s.equityUniverseCache, nil
+	}
+
+	if s.equityProvider != nil {
+		items, err := s.equityProvider(ctx)
+		if err == nil && len(items) > 0 {
+			s.equityUniverseCache = items
+			s.equityUniverseExpiry = time.Now().Add(5 * time.Minute)
+			return items, nil
+		}
+	}
+
+	if s.db != nil {
+		var dbItems []EquityUniverseItem
+		err := s.db.WithContext(ctx).
+			Table("instruments").
+			Select("symbol, name, COALESCE(NULLIF(exchange, ''), exchange_segment) as exchange").
+			Where("exchange_segment = ? AND (instrument_type = ? OR instrument_type = ? OR instrument_type = '') AND (active = ? OR active IS NULL)", "NSE", "EQUITY", "EQ", true).
+			Order("symbol ASC").
+			Find(&dbItems).Error
+		if err == nil && len(dbItems) > 0 {
+			s.equityUniverseCache = dbItems
+			s.equityUniverseExpiry = time.Now().Add(5 * time.Minute)
+			return dbItems, nil
+		}
+	}
+
+	s.equityUniverseCache = DefaultEquityUniverse
+	s.equityUniverseExpiry = time.Now().Add(5 * time.Minute)
+	return DefaultEquityUniverse, nil
+}
+
+// collectValidEquityQuotes extracts, validates, and standardizes authoritative live quotes
+// for all equities in the configured universe. Quotes failing freshness, price validity,
+// or feed-mode compliance are strictly excluded.
+func (s *Service) collectValidEquityQuotes(ctx context.Context) ([]dto.MarketMoverItem, error) {
+	if s == nil || s.client == nil {
+		return nil, ErrQuoteUnavailable
+	}
+
+	mode := s.FeedMode()
+	if mode == dto.FeedModeUnavailable {
+		return nil, ErrQuoteUnavailable
+	}
+
+	// Verify Redis feed state
+	if feedState, err := s.client.HGet(ctx, FeedStateKey, "feed_state").Result(); err == nil {
+		if strings.ToUpper(strings.TrimSpace(feedState)) == string(dto.FeedModeUnavailable) {
+			return nil, ErrQuoteUnavailable
+		}
+	}
+
+	universe, err := s.GetEquityUniverse(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(universe) == 0 {
+		return nil, nil
+	}
+
+	// Execute single pipelined HGetAll for the entire equity universe
+	pipe := s.client.Pipeline()
+	cmds := make(map[string]*redis.MapStringStringCmd, len(universe))
+	for _, inst := range universe {
+		cmds[inst.Symbol] = pipe.HGetAll(ctx, quoteKey(inst.Symbol))
+	}
+	_, err = pipe.Exec(ctx)
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("%w: %v", cache.ErrUnavailable, err)
+	}
+
+	now := time.Now()
+	items := make([]dto.MarketMoverItem, 0, len(universe))
+
+	for _, inst := range universe {
+		values := cmds[inst.Symbol].Val()
+		if len(values) == 0 {
+			// Check canonical alias
+			canonical := alias.ResolveCanonicalSymbol(inst.Symbol)
+			if canonical != "" && canonical != inst.Symbol {
+				if cValues, cErr := s.client.HGetAll(ctx, quoteKey(canonical)).Result(); cErr == nil && len(cValues) > 0 {
+					values = cValues
+				}
+			}
+		}
+
+		if len(values) == 0 {
+			continue
+		}
+
+		source := values["source"]
+		if !s.allowSeededQuotes && IsSeededSource(source) {
+			continue
+		}
+
+		normSource := dto.NormalizeQuoteSource(source)
+		if mode == dto.FeedModeLive && normSource != dto.QuoteSourceAngelOneLive {
+			continue
+		}
+		if mode == dto.FeedModeSynthetic && normSource == dto.QuoteSourceAngelOneLive {
+			continue
+		}
+
+		price, parsePriceErr := strconv.ParseInt(values["price_paise"], 10, 64)
+		if parsePriceErr != nil || price <= 0 {
+			continue
+		}
+
+		updatedAtStr, ok := values["updated_at"]
+		if !ok || strings.TrimSpace(updatedAtStr) == "" {
+			continue
+		}
+
+		updatedAt, parseErr := dto.ParseQuoteTime(updatedAtStr)
+		if parseErr != nil || updatedAt.After(now.Add(5*time.Second)) || now.Sub(updatedAt) > maxExecutableQuoteAge {
+			continue
+		}
+		// Missing daily movement is unknown, not an unchanged stock. Keep it out
+		// of rankings and breadth until the provider supplies a previous close.
+		previousClose, closeErr := strconv.ParseInt(values["previous_close_paise"], 10, 64)
+		if values["day_change_available"] != "true" || closeErr != nil || previousClose <= 0 {
+			continue
+		}
+
+		var changePaise int64
+		var changePercent float64
+		var volume int64
+		changePaise, changeErr := strconv.ParseInt(values["change_paise"], 10, 64)
+		changePercent, percentErr := strconv.ParseFloat(values["change_percent"], 64)
+		if changeErr != nil || percentErr != nil || math.IsNaN(changePercent) || math.IsInf(changePercent, 0) {
+			continue
+		}
+		if v, ok := values["volume"]; ok {
+			volume, _ = strconv.ParseInt(v, 10, 64)
+		}
+
+		var highPaise, lowPaise int64
+		if h, ok := values["high_paise"]; ok {
+			highPaise, _ = strconv.ParseInt(h, 10, 64)
+		}
+		if l, ok := values["low_paise"]; ok {
+			lowPaise, _ = strconv.ParseInt(l, 10, 64)
+		}
+
+		turnover := (float64(price) / 100.0) * float64(volume)
+
+		// TrendingScore Formula:
+		//   Score = |ChangePercent| * (1.0 + log10(max(1.0, Volume)))
+		// Combines percentage price velocity scaled logarithmically by accumulated market
+		// volume. If volume is unrecorded or zero, the multiplier degrades smoothly to 1.0,
+		// preserving pure price velocity.
+		volMultiplier := 1.0 + math.Log10(math.Max(1.0, float64(volume)))
+		trendingScore := math.Abs(changePercent) * volMultiplier
+
+		items = append(items, dto.MarketMoverItem{
+			Symbol:        inst.Symbol,
+			Name:          inst.Name,
+			PricePaise:    price,
+			ChangePaise:   changePaise,
+			ChangePercent: math.Round(changePercent*100) / 100,
+			Volume:        volume,
+			HighPaise:     highPaise,
+			LowPaise:      lowPaise,
+			Turnover:      math.Round(turnover*100) / 100,
+			TrendingScore: math.Round(trendingScore*100) / 100,
+			Exchange:      inst.Exchange,
+			Source:        source,
+			UpdatedAt:     values["updated_at"],
+		})
+	}
+
+	return items, nil
+}
+
+// GetMarketMovers dynamically computes top gainers, top losers, most traded,
+// and trending equities from authoritative live quotes.
+//
+// In accordance with Master Plan Acceptance Criteria:
+// - All values are computed dynamically from valid quotes in the configured universe.
+// - Never returns static mock arrays. When quotes are unavailable or empty, returns empty slices.
+func (s *Service) GetMarketMovers(ctx context.Context, limit int) (*dto.MarketMoversResponse, error) {
+	if limit <= 0 {
+		limit = 10
+	} else if limit > 50 {
+		limit = 50
+	}
+
+	items, err := s.collectValidEquityQuotes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &dto.MarketMoversResponse{
+		Gainers:    make([]dto.MarketMoverItem, 0),
+		Losers:     make([]dto.MarketMoverItem, 0),
+		MostTraded: make([]dto.MarketMoverItem, 0),
+		Trending:   make([]dto.MarketMoverItem, 0),
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if len(items) == 0 {
+		return resp, nil
+	}
+
+	// 1. Top Gainers: changePercent > 0 or changePaise > 0, sorted descending
+	var gainers []dto.MarketMoverItem
+	for _, it := range items {
+		if it.ChangePercent > 0 || it.ChangePaise > 0 {
+			gainers = append(gainers, it)
+		}
+	}
+	sort.Slice(gainers, func(i, j int) bool {
+		if gainers[i].ChangePercent != gainers[j].ChangePercent {
+			return gainers[i].ChangePercent > gainers[j].ChangePercent
+		}
+		return gainers[i].Volume > gainers[j].Volume
+	})
+	if len(gainers) > limit {
+		gainers = gainers[:limit]
+	}
+	resp.Gainers = gainers
+
+	// 2. Top Losers: changePercent < 0 or changePaise < 0, sorted ascending (biggest drop first)
+	var losers []dto.MarketMoverItem
+	for _, it := range items {
+		if it.ChangePercent < 0 || it.ChangePaise < 0 {
+			losers = append(losers, it)
+		}
+	}
+	sort.Slice(losers, func(i, j int) bool {
+		if losers[i].ChangePercent != losers[j].ChangePercent {
+			return losers[i].ChangePercent < losers[j].ChangePercent
+		}
+		return losers[i].Volume > losers[j].Volume
+	})
+	if len(losers) > limit {
+		losers = losers[:limit]
+	}
+	resp.Losers = losers
+
+	// 3. Most Traded: ranked by turnover, then volume, then absolute changePercent
+	traded := make([]dto.MarketMoverItem, len(items))
+	copy(traded, items)
+	sort.Slice(traded, func(i, j int) bool {
+		if traded[i].Turnover != traded[j].Turnover {
+			return traded[i].Turnover > traded[j].Turnover
+		}
+		if traded[i].Volume != traded[j].Volume {
+			return traded[i].Volume > traded[j].Volume
+		}
+		return math.Abs(traded[i].ChangePercent) > math.Abs(traded[j].ChangePercent)
+	})
+	if len(traded) > limit {
+		traded = traded[:limit]
+	}
+	resp.MostTraded = traded
+
+	// 4. Trending: ranked by TrendingScore (|ChangePercent| * (1 + log10(max(1, Volume))))
+	trending := make([]dto.MarketMoverItem, len(items))
+	copy(trending, items)
+	sort.Slice(trending, func(i, j int) bool {
+		if trending[i].TrendingScore != trending[j].TrendingScore {
+			return trending[i].TrendingScore > trending[j].TrendingScore
+		}
+		return trending[i].Volume > trending[j].Volume
+	})
+	if len(trending) > limit {
+		trending = trending[:limit]
+	}
+	resp.Trending = trending
+
+	return resp, nil
+}
+
+// GetMarketBreadth dynamically computes advances, declines, and unchanged counts
+// across the configured equity universe.
+func (s *Service) GetMarketBreadth(ctx context.Context) (*dto.MarketBreadthResponse, error) {
+	items, err := s.collectValidEquityQuotes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	advances := 0
+	declines := 0
+	unchanged := 0
+
+	for _, item := range items {
+		if item.ChangePercent > 0 || item.ChangePaise > 0 {
+			advances++
+		} else if item.ChangePercent < 0 || item.ChangePaise < 0 {
+			declines++
+		} else {
+			unchanged++
+		}
+	}
+
+	total := advances + declines + unchanged
+	var adRatio float64
+	if declines > 0 {
+		adRatio = math.Round((float64(advances)/float64(declines))*100) / 100
+	} else if advances > 0 {
+		adRatio = float64(advances)
+	}
+
+	var advPct float64
+	if total > 0 {
+		advPct = math.Round((float64(advances)/float64(total))*10000) / 100
+	}
+
+	return &dto.MarketBreadthResponse{
+		Advances:            advances,
+		Declines:            declines,
+		Unchanged:           unchanged,
+		Total:               total,
+		AdvanceDeclineRatio: adRatio,
+		AdvancePercent:      advPct,
+		UpdatedAt:           time.Now().UTC().Format(time.RFC3339),
+	}, nil
+}
+
+// BenchmarkIndices represents the core institutional benchmark indices.
+var BenchmarkIndices = []struct {
+	Symbol string
+	Name   string
+}{
+	{Symbol: "NIFTY", Name: "NIFTY 50"},
+	{Symbol: "BANKNIFTY", Name: "BANK NIFTY"},
+	{Symbol: "FINNIFTY", Name: "FIN NIFTY"},
+	{Symbol: "SENSEX", Name: "BSE SENSEX"},
+	{Symbol: "MIDCPNIFTY", Name: "NIFTY MIDCAP SELECT"},
+}
+
+// GetMarketIndices dynamically retrieves authoritative index quotes from Redis.
+func (s *Service) GetMarketIndices(ctx context.Context) ([]dto.MarketIndexItem, error) {
+	if s == nil || s.client == nil {
+		return nil, ErrQuoteUnavailable
+	}
+
+	mode := s.FeedMode()
+	if mode == dto.FeedModeUnavailable {
+		return nil, ErrQuoteUnavailable
+	}
+
+	// Verify Redis feed state
+	if feedState, err := s.client.HGet(ctx, FeedStateKey, "feed_state").Result(); err == nil {
+		if strings.ToUpper(strings.TrimSpace(feedState)) == string(dto.FeedModeUnavailable) {
+			return nil, ErrQuoteUnavailable
+		}
+	}
+
+	results := make([]dto.MarketIndexItem, 0, len(BenchmarkIndices))
+	now := time.Now()
+
+	for _, idx := range BenchmarkIndices {
+		item := dto.MarketIndexItem{
+			Symbol:      idx.Symbol,
+			Name:        idx.Name,
+			IsAvailable: false,
+			QuoteStatus: string(dto.QuoteSourceUnavailable),
+		}
+
+		quote, err := s.CurrentQuote(idx.Symbol)
+		if err == nil && quote != nil && quote.PricePaise > 0 {
+			item.PricePaise = quote.PricePaise
+			item.ChangePaise = quote.ChangePaise
+			item.ChangePercent = math.Round(quote.ChangePercent*100) / 100
+			item.IsAvailable = true
+			item.QuoteStatus = string(quote.Source)
+			item.UpdatedAt = quote.UpdatedAt
+		} else if mode == dto.FeedModeSynthetic {
+			basePaise := int64(2450000)
+			if idx.Symbol == "BANKNIFTY" {
+				basePaise = 5200000
+			} else if idx.Symbol == "FINNIFTY" {
+				basePaise = 2350000
+			} else if idx.Symbol == "SENSEX" {
+				basePaise = 8100000
+			} else if idx.Symbol == "MIDCPNIFTY" {
+				basePaise = 1300000
+			}
+			item.PricePaise = basePaise
+			item.ChangePaise = 0
+			item.ChangePercent = 0.0
+			item.IsAvailable = true
+			item.QuoteStatus = string(dto.QuoteSourceSyntheticGBM)
+			item.UpdatedAt = now.UTC().Format(time.RFC3339)
+		}
+
+		results = append(results, item)
+	}
+
+	return results, nil
+}
+
+// SectorDefinitions maps market sectors to their representative institutional constituents.
+var SectorDefinitions = []struct {
+	ID           string
+	Name         string
+	Constituents []string
+}{
+	{ID: "banking", Name: "Banking & Financials", Constituents: []string{"HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK", "BAJFINANCE", "POONAWALLA", "YESBANK"}},
+	{ID: "it", Name: "Information Technology", Constituents: []string{"TCS", "INFY"}},
+	{ID: "energy", Name: "Energy & Utilities", Constituents: []string{"RELIANCE", "TATAPOWER", "SUZLON", "ATGL"}},
+	{ID: "auto", Name: "Automobiles", Constituents: []string{"TATAMOTORS", "MARUTI"}},
+	{ID: "fmcg", Name: "FMCG & Consumer", Constituents: []string{"TRENT", "ETERNAL"}},
+	{ID: "industrials", Name: "Industrials & Defense", Constituents: []string{"BEL", "APARINDS", "PRAJIND", "BHARTIARTL"}},
+	{ID: "chemicals", Name: "Chemicals & Materials", Constituents: []string{"TATACHEM", "ADANIENT"}},
+}
+
+// GetMarketSectors dynamically computes sectoral breadth, mean price change,
+// and top performing stock across each sector from authoritative equity quotes.
+func (s *Service) GetMarketSectors(ctx context.Context) ([]dto.MarketSectorItem, error) {
+	items, err := s.collectValidEquityQuotes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	quoteMap := make(map[string]dto.MarketMoverItem, len(items))
+	for _, it := range items {
+		quoteMap[strings.ToUpper(it.Symbol)] = it
+	}
+
+	sectors := make([]dto.MarketSectorItem, 0, len(SectorDefinitions))
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+
+	for _, sec := range SectorDefinitions {
+		var gainers, losers int
+		var totalChange float64
+		var activeCount int
+		var topStock string
+		maxChange := -math.MaxFloat64
+
+		for _, sym := range sec.Constituents {
+			q, exists := quoteMap[sym]
+			if !exists || q.PricePaise <= 0 {
+				continue
+			}
+			activeCount++
+			if q.ChangePercent > 0 || q.ChangePaise > 0 {
+				gainers++
+			} else if q.ChangePercent < 0 || q.ChangePaise < 0 {
+				losers++
+			}
+			totalChange += q.ChangePercent
+			if q.ChangePercent > maxChange {
+				maxChange = q.ChangePercent
+				topStock = sym
+			}
+		}
+
+		secItem := dto.MarketSectorItem{
+			ID:           sec.ID,
+			Name:         sec.Name,
+			GainersCount: gainers,
+			LosersCount:  losers,
+			Constituents: activeCount,
+			TopStock:     "—",
+			UpdatedAt:    nowStr,
+		}
+
+		if activeCount > 0 {
+			secItem.ChangePercent = math.Round((totalChange/float64(activeCount))*100) / 100
+			secItem.TopStock = topStock
+			secItem.TopStockChange = math.Round(maxChange*100) / 100
+		}
+
+		sectors = append(sectors, secItem)
+	}
+
+	return sectors, nil
+}

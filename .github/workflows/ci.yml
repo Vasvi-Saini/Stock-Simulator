@@ -1,0 +1,290 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  production-gateway:
+    name: Production Gateway HTTPS and WSS Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull gateway base images with registry fallback
+        run: python3 scripts/ci_pull_images.py caddy:2-alpine redis:7-alpine postgres:16-alpine debian:bookworm-slim
+      - name: Verify production Compose and Caddy against real Go backend
+        run: python3 scripts/smoke_production_gateway.py
+      - name: Verify optional broker proxy image and configuration
+        run: |
+          docker build -t stocksim-broker-proxy-test deploy/oracle/broker-proxy
+          docker run --rm --entrypoint privoxy -v "$PWD/deploy/oracle/broker-proxy/config:/etc/privoxy/config:ro" stocksim-broker-proxy-test --no-daemon --config-test /etc/privoxy/config
+
+  backend:
+    name: Go Backend & Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      TEST_DATABASE_URL: "postgresql://postgres:postgres@localhost:5433/testdb?sslmode=disable"
+      TEST_REDIS_URL: "redis://localhost:6380/0"
+      PGUSER: "postgres"
+      PGPASSWORD: "postgres"
+    steps:
+      - uses: actions/checkout@v4
+      # Job-level services pull before checkout, so they cannot use fallback.
+      - name: Start disposable PostgreSQL and Redis with registry fallback
+        run: |
+          python3 ../scripts/ci_pull_images.py postgres:16-alpine redis:7-alpine
+          docker run --detach --pull never --name ci-postgres \
+            -p 127.0.0.1:5433:5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=testdb \
+            --health-cmd "pg_isready -U postgres -d testdb" \
+            --health-interval 2s --health-timeout 5s --health-retries 15 \
+            postgres:16-alpine
+          docker run --detach --pull never --name ci-redis \
+            -p 127.0.0.1:6380:6379 \
+            --health-cmd "redis-cli ping" \
+            --health-interval 2s --health-timeout 5s --health-retries 15 \
+            redis:7-alpine
+          for container in ci-postgres ci-redis; do
+            status=""
+            for attempt in $(seq 1 30); do
+              status=$(docker inspect --format '{{.State.Health.Status}}' "$container")
+              if [ "$status" = healthy ]; then break; fi
+              if [ "$status" = unhealthy ]; then break; fi
+              sleep 2
+            done
+            if [ "$status" != healthy ]; then
+              docker logs "$container"
+              echo "::error::$container did not become healthy"
+              exit 1
+            fi
+          done
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: backend/go.sum
+
+      - name: Download Go dependencies
+        run: go mod download
+
+      - name: Check formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run Backend Tests
+        run: go test -v -count=1 -p 1 ./...
+
+      - name: Race Check Accounting, Exit Retries and Shared Market Streaming
+        run: go test -race -count=1 ./internal/order/service ./internal/accountchanges ./internal/market/service ./internal/market/websocket
+
+      - name: Compare Display Quote Readers on Disposable Redis
+        run: go test -run '^$' -bench BenchmarkDisplayBatch -benchmem -benchtime=1s -count=3 ./internal/market/service
+
+      - name: Compare Backend Startup and Metadata Benchmarks
+        run: |
+          go test -run '^$' -bench 'BenchmarkWarmSchemaStartup|BenchmarkMasterMetadataProjection|BenchmarkInstrumentFinderBootstrap' -benchtime=3x -count=1 ./internal/app ./internal/router > "$RUNNER_TEMP/backend-benchmarks.txt"
+          cat "$RUNNER_TEMP/backend-benchmarks.txt"
+          DATABASE_URL="$TEST_DATABASE_URL" go run ./cmd/profile-db -samples 5 -plans > "$RUNNER_TEMP/database-profile.json"
+
+      - name: Dump and restore accounting state in an isolated disposable database
+        run: |
+          docker exec ci-postgres pg_dump -U postgres -d testdb --format=custom > "$RUNNER_TEMP/accounting.dump"
+          python3 -c 'import sys; sys.path.insert(0, "../scripts"); from verify_backup_restore import FINGERPRINT_SQL; print(FINGERPRINT_SQL)' > "$RUNNER_TEMP/fingerprint.sql"
+          docker exec -i ci-postgres psql -U postgres -d testdb -At -v ON_ERROR_STOP=1 < "$RUNNER_TEMP/fingerprint.sql" > "$RUNNER_TEMP/fingerprint.txt"
+          python3 ../scripts/verify_backup_restore.py "$RUNNER_TEMP/accounting.dump" --expected-fingerprint "$RUNNER_TEMP/fingerprint.txt" > "$RUNNER_TEMP/restore-verification.json" || { cat "$RUNNER_TEMP/restore-verification.json"; exit 1; }
+          cat "$RUNNER_TEMP/restore-verification.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-performance-measurements
+          path: |
+            ${{ runner.temp }}/backend-benchmarks.txt
+            ${{ runner.temp }}/database-profile.json
+            ${{ runner.temp }}/restore-verification.json
+
+      - name: Clean up disposable backend services
+        if: always()
+        run: |
+          for container in ci-postgres ci-redis; do
+            if docker inspect "$container" > /dev/null 2>&1; then
+              docker logs "$container"
+              docker rm --force "$container"
+            fi
+          done
+
+  python-workers:
+    name: Python Workers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Market Worker Dependencies
+        working-directory: python-services/market-worker
+        run: pip install -r requirements.txt
+
+      - name: Test Market Worker
+        working-directory: python-services/market-worker
+        run: python3 -m unittest discover -v -p 'test_*.py'
+
+      - name: Install News Worker Dependencies
+        working-directory: python-services/news-worker
+        run: pip install -r requirements.txt
+
+      - name: Test News Worker
+        working-directory: python-services/news-worker
+        run: python3 -m unittest discover -v -p 'test_*.py'
+
+      - name: Test Local Startup and Cleanup
+        run: python3 -m unittest discover -v -s scripts -p 'test_*.py'
+
+  frontend:
+    name: Next.js Frontend Quality Gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: TypeScript Type Check
+        run: npx tsc --noEmit
+
+      - name: Run Unit Tests
+        run: |
+          npm test
+          node --test scripts/profile-report.test.mjs
+
+      - name: Production Build
+        run: npm run build
+
+  browser:
+    name: Authenticated Paper Trading Browser Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+        env:
+          POLLING_PROFILE_OUTPUT: artifacts/mobile
+          MOBILE_PROFILE_OUTPUT: artifacts/mobile
+      - name: Profile public mobile routes
+        run: npm run profile:mobile -- --paths /,/login --runs 1 --output artifacts/mobile
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobile-browser-measurements
+          path: frontend/artifacts/mobile/
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-failure-traces
+          path: frontend/test-results/
+          retention-days: 7
+
+  frontend-runtime:
+    name: Standalone Frontend Docker Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Pull Node base image with registry fallback
+        run: python3 scripts/ci_pull_images.py node:22-alpine
+      - name: Build production runtime image
+        run: docker build --tag stock-simulator-frontend:ci frontend
+      - name: Smoke non-root runtime, static assets and redirects
+        run: |
+          docker run --detach --name frontend-smoke -p 3200:3000 stock-simulator-frontend:ci
+          trap 'docker logs frontend-smoke; docker rm --force frontend-smoke' EXIT
+          test "$(docker exec frontend-smoke id -u)" = "1001"
+          node frontend/scripts/smoke-standalone.mjs --url http://127.0.0.1:3200
+          docker image inspect stock-simulator-frontend:ci --format 'Runtime image bytes: {{.Size}}'
+
+  performance-comparison:
+    name: Homepage Performance Comparison and Deployed Read-only Profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Prepare baseline build
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          test "${#BASE_REF}" = 40
+          git worktree add --detach "$RUNNER_TEMP/performance-baseline" "$BASE_REF"
+          npm --prefix "$RUNNER_TEMP/performance-baseline/frontend" ci
+          npm --prefix "$RUNNER_TEMP/performance-baseline/frontend" run build
+      - name: Compare the unchanged homepage design under identical browser conditions
+        run: |
+          node scripts/profile-mobile.mjs --app-dir "$RUNNER_TEMP/performance-baseline/frontend" --paths / --runs 2 --account-window 10 --output artifacts/comparison/before
+          npm run build
+          node scripts/profile-mobile.mjs --paths / --runs 2 --account-window 10 --output artifacts/comparison/after
+          node scripts/compare-lab.mjs artifacts/comparison/before/mobile.json artifacts/comparison/after/mobile.json artifacts/comparison/summary.json
+      - name: Measure current deployed public routes without account writes
+        run: |
+          node scripts/profile-mobile.mjs --url https://www.stock-simulator.in --paths /,/login,/stocks,/options --motion no-preference --runs 2 --output artifacts/deployed/mobile
+          node scripts/profile-mobile.mjs --url https://www.stock-simulator.in --device desktop --paths /,/login,/stocks,/options --motion no-preference --runs 2 --output artifacts/deployed/desktop
+      - name: Record production dependency audit
+        run: |
+          npm audit --omit=dev --json > artifacts/comparison/dependency-audit.json || test -s artifacts/comparison/dependency-audit.json
+          node -e 'const report = require("./artifacts/comparison/dependency-audit.json"); console.log(JSON.stringify({counts: report.metadata?.vulnerabilities, packages: report.vulnerabilities}, null, 2))'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: homepage-performance-and-deployed-profile
+          path: frontend/artifacts/
+          retention-days: 7

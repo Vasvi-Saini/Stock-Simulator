@@ -1,0 +1,55 @@
+# Public edge for docker-compose.prod.yml. Keep DNS direct to the VM.
+# Caddy replaces incoming X-Forwarded-* values by default. Go trusts only
+# CADDY_INTERNAL_IP; do not add broad trusted_proxies here for arbitrary clients.
+{
+    email {$ACME_EMAIL}
+}
+
+{$API_DOMAIN} {
+    @compressible {
+        not path /api/v1/account/events
+    }
+    # Private event frames are small and must flush immediately on every version.
+    encode @compressible zstd gzip
+
+    handle /api/* {
+        # Trading/account responses must not be cached by browsers or proxies.
+        header Cache-Control "no-store"
+        reverse_proxy backend:8080
+    }
+
+    handle /ws/* {
+        reverse_proxy backend:8080
+    }
+
+    handle /health {
+        header Cache-Control "no-store"
+        rewrite * /api/v1/health
+        reverse_proxy backend:8080
+    }
+
+    handle /ready {
+        header Cache-Control "no-store"
+        rewrite * /api/v1/ready
+        reverse_proxy backend:8080
+    }
+
+    handle /openapi.yaml {
+        rewrite * /api/v1/openapi.yaml
+        reverse_proxy backend:8080
+    }
+
+    handle {
+        respond "Not found" 404
+    }
+
+    log {
+        output stdout
+        format filter {
+            wrap json
+            fields {
+                request>headers>X-Frontend-Proxy-Secret delete
+            }
+        }
+    }
+}

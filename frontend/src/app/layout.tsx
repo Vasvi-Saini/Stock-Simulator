@@ -1,0 +1,115 @@
+import { SpeedInsights } from "@vercel/speed-insights/next";
+import { SITE_URL, SITE_NAME, SITE_DESCRIPTION } from "@/lib/seo";
+import type { Metadata, Viewport } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import { ToastProvider } from "@/components/ui/ToastProvider";
+import { ThemeProvider } from "@/providers/theme-provider";
+
+const geistSans = Geist({
+  variable: "--font-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-mono",
+  subsets: ["latin"],
+});
+
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f8fafc" },
+    { media: "(prefers-color-scheme: dark)", color: "#06080e" },
+  ],
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 5,
+  userScalable: true,
+  viewportFit: "cover",
+};
+
+export const metadata: Metadata = {
+  metadataBase: new URL(SITE_URL),
+  title: { default: "Stock Simulator — Paper Trading in India", template: "%s | Stock Simulator" },
+  description: SITE_DESCRIPTION,
+  applicationName: SITE_NAME,
+  verification: {
+    google: process.env.NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION || undefined,
+  },
+  robots: { index: false, follow: true },
+  manifest: "/manifest.webmanifest",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "StockSim",
+  },
+  formatDetection: {
+    telephone: false,
+  },
+  icons: {
+    icon: [
+      { url: "/favicon.svg", type: "image/svg+xml" },
+      { url: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icons/icon-512.png", sizes: "512x512", type: "image/png" },
+    ],
+    apple: [
+      { url: "/icons/apple-touch-icon.png", sizes: "180x180", type: "image/png" },
+    ],
+  },
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html
+      lang="en"
+      suppressHydrationWarning
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+    >
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var s=localStorage.getItem("stock_sim_theme");var isDark=s==="dark";var d=document.documentElement;if(isDark){d.classList.add("dark");d.classList.remove("light");d.setAttribute("data-theme","dark");d.style.colorScheme="dark";}else{d.classList.remove("dark");d.classList.add("light");d.setAttribute("data-theme","light");d.style.colorScheme="light";}}catch(e){}})();`,
+          }}
+        />
+      </head>
+      <body className="min-h-full flex flex-col bg-slate-50 dark:bg-[#06080e] text-slate-900 dark:text-slate-100 font-sans selection:bg-cyan-500 selection:text-slate-950 relative">
+        {/* MotionSites AI Signature Ambient Depth & Glow Mesh (Dark Mode) */}
+        <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden hidden dark:block">
+          {/* Top Center Electric Cyan/Indigo Aurora Flare */}
+          <div className="absolute -top-40 left-1/2 -translate-x-1/2 w-[1100px] h-[500px] bg-gradient-to-b from-cyan-500/15 via-blue-600/10 to-transparent rounded-full blur-[100px] opacity-75" />
+          {/* Right Violet Atmospheric Glow */}
+          <div className="absolute top-[20%] -right-48 w-[650px] h-[550px] bg-gradient-to-br from-indigo-600/10 via-purple-600/6 to-transparent rounded-full blur-[110px] opacity-60" />
+          {/* Left Emerald Depth Flare */}
+          <div className="absolute top-[55%] -left-48 w-[600px] h-[550px] bg-gradient-to-tr from-emerald-500/8 via-cyan-500/5 to-transparent rounded-full blur-[120px] opacity-50" />
+          {/* MotionSites Subtle Matrix Grid Mask */}
+          <div className="absolute inset-0 bg-[radial-gradient(rgba(255,255,255,0.04)_1px,transparent_1px)] [background-size:24px_24px] [mask-image:radial-gradient(ellipse_70%_60%_at_50%_0%,#000_70%,transparent_100%)] opacity-85" />
+        </div>
+
+        {/* MotionSites AI Radiant Ambient Aurora Mesh (Light Mode Glassmorphism) */}
+        <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden block dark:hidden">
+          {/* Top Center Radiant Sky Flare */}
+          <div className="absolute -top-36 left-1/2 -translate-x-1/2 w-[1100px] h-[520px] bg-gradient-to-b from-sky-400/25 via-cyan-300/12 to-transparent rounded-full blur-[100px] opacity-80" />
+          {/* Right Indigo/Violet Ethereal Flare */}
+          <div className="absolute top-[15%] -right-40 w-[650px] h-[550px] bg-gradient-to-br from-indigo-300/20 via-purple-300/12 to-transparent rounded-full blur-[110px] opacity-70" />
+          {/* Left Emerald/Teal Depth Flare */}
+          <div className="absolute top-[50%] -left-40 w-[600px] h-[550px] bg-gradient-to-tr from-emerald-300/18 via-teal-300/10 to-transparent rounded-full blur-[120px] opacity-65" />
+          {/* Light Mode Subtle Matrix Grid */}
+          <div className="absolute inset-0 bg-[radial-gradient(rgba(15,23,42,0.06)_1px,transparent_1px)] [background-size:24px_24px] [mask-image:radial-gradient(ellipse_75%_65%_at_50%_0%,#000_70%,transparent_100%)] opacity-70" />
+        </div>
+
+        {process.env.NEXT_PUBLIC_ENABLE_SPEED_INSIGHTS === "true" && <SpeedInsights />}
+        <div className="relative z-10 flex-1 flex flex-col">
+          <ThemeProvider>
+            <ToastProvider>
+              {children}
+            </ToastProvider>
+          </ThemeProvider>
+        </div>
+      </body>
+    </html>
+  );
+}

@@ -1,0 +1,376 @@
+package service
+
+import (
+	"context"
+	orderDTO "github.com/Dhiraj10002/Stock-Simulator/backend/internal/order/dto"
+	orderService "github.com/Dhiraj10002/Stock-Simulator/backend/internal/order/service"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/ai/dto"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/config"
+)
+
+func TestMentorService_Analyze_RuleBasedFallback(t *testing.T) {
+	cfg := &config.Config{
+		GeminiAPIKey: "",
+		GeminiModel:  "gemini-2.0-flash",
+	}
+	svc := New(cfg)
+	svc.OrderPreview = func(_ string, req orderDTO.CreateOrderRequest) (*orderService.OrderPreview, error) {
+		return &orderService.OrderPreview{RequiredFundsPaise: 2500000, AvailableBalancePaise: 100000000, SufficientFunds: true}, nil
+	}
+
+	tests := []struct {
+		name     string
+		question string
+		expected string
+	}{
+		{
+			name:     "MIS intraday question",
+			question: "What happens during 15:20 MIS square-off?",
+			expected: "MIS (Margin Intraday Square-off) Rules",
+		},
+		{
+			name:     "FNO derivatives question",
+			question: "How do options and futures settle on expiry?",
+			expected: "F&O (Futures & Options) Mechanics",
+		},
+		{
+			name:     "Margin and leverage question",
+			question: "How does blocked margin work in my wallet?",
+			expected: "Virtual Margin & Capital Management",
+		},
+		{
+			name:     "CNC delivery question",
+			question: "Can I short-sell delivery CNC shares?",
+			expected: "CNC (Cash-and-Carry / Delivery) Rules",
+		},
+		{
+			name:     "General trading question",
+			question: "How should I structure my daily routine and setup?",
+			expected: "Educational Simulator Copilot",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ans, err := svc.Analyze(context.Background(), "user-123", tc.question)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !strings.Contains(ans, tc.expected) {
+				t.Errorf("expected answer to contain %q, got %q", tc.expected, ans)
+			}
+		})
+	}
+}
+
+func TestMentorService_BuildRuleBasedCritique(t *testing.T) {
+	cfg := &config.Config{
+		GeminiAPIKey: "",
+		GeminiModel:  "gemini-2.0-flash",
+	}
+	svc := New(cfg)
+	svc.OrderPreview = func(_ string, req orderDTO.CreateOrderRequest) (*orderService.OrderPreview, error) {
+		return &orderService.OrderPreview{RequiredFundsPaise: 2500000, AvailableBalancePaise: 100000000, SufficientFunds: true}, nil
+	}
+
+	metrics := dto.CritiqueMetrics{
+		WinRate:                60.0,
+		ConcentrationRisk:      "HIGH",
+		LeverageRisk:           "SAFE",
+		RevengeTradingDetected: true,
+		LimitOrderUsagePct:     75.0,
+		TotalTradesEvaluated:   10,
+	}
+
+	critique := svc.buildRuleBasedCritique(65, "MODERATE", "B", metrics, "RELIANCE")
+	expectedSubstrings := []string{
+		"Trader Discipline Grade: B — MODERATE (65 / 100)",
+		"Impulse Warning:",
+		"Concentration Risk:",
+		"RELIANCE",
+		"Execution Discipline:",
+		"Win Rate:",
+	}
+
+	for _, sub := range expectedSubstrings {
+		if !strings.Contains(critique, sub) {
+			t.Errorf("critique missing expected substring: %q", sub)
+		}
+	}
+}
+
+func TestMathAbs(t *testing.T) {
+	if mathAbs(10) != 10 {
+		t.Errorf("expected 10, got %d", mathAbs(10))
+	}
+	if mathAbs(-10) != 10 {
+		t.Errorf("expected 10, got %d", mathAbs(-10))
+	}
+	if mathAbs(0) != 0 {
+		t.Errorf("expected 0, got %d", mathAbs(0))
+	}
+}
+
+func TestMentorService_PreTradeCheck(t *testing.T) {
+	cfg := &config.Config{
+		GeminiAPIKey: "",
+		GeminiModel:  "gemini-2.0-flash",
+	}
+	svc := New(cfg)
+	svc.OrderPreview = func(_ string, req orderDTO.CreateOrderRequest) (*orderService.OrderPreview, error) {
+		return &orderService.OrderPreview{RequiredFundsPaise: 2500000, AvailableBalancePaise: 100000000, SufficientFunds: true}, nil
+	}
+
+	// Test Slippage Warning on Market order > 50 qty + Missing SL warning on INTRADAY
+	req := dto.PreTradeCheckRequest{
+		Symbol:     "RELIANCE",
+		Side:       "BUY",
+		Product:    "INTRADAY",
+		Type:       "MARKET",
+		Quantity:   100,
+		PricePaise: 125000, // ₹1,250.00
+	}
+
+	res, err := svc.PreTradeCheck(context.Background(), "31372e69-2088-45d8-a2d8-8607a58e3685", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if res.RequiredMarginPaise != 2500000 { // (100 * 125000 + 4) / 5 = 2,500,000 paise (₹25,000)
+		t.Errorf("expected required margin 2500000 paise, got %d", res.RequiredMarginPaise)
+	}
+
+	// Should contain slippage warning and missing SL warning
+	hasSlippageWarning := false
+	hasMissingSLWarning := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "Exchange Slippage Alert") {
+			hasSlippageWarning = true
+		}
+		if strings.Contains(w, "Missing Stop-Loss Protection") {
+			hasMissingSLWarning = true
+		}
+	}
+	if !hasSlippageWarning {
+		t.Errorf("expected slippage warning for 100 qty market order, warnings: %v", res.Warnings)
+	}
+	if !hasMissingSLWarning {
+		t.Errorf("expected missing stop-loss warning for intraday order without SL, warnings: %v", res.Warnings)
+	}
+
+	// Test Risk-to-Reward calculation
+	reqWithRR := dto.PreTradeCheckRequest{
+		Symbol:        "NIFTY24DEC24000CE",
+		Side:          "BUY",
+		Product:       "FNO",
+		Type:          "LIMIT",
+		Quantity:      25,
+		PricePaise:    10000, // ₹100
+		StopLossPaise: 9000,  // ₹90 (Risk: ₹10)
+		TargetPaise:   12500, // ₹125 (Reward: ₹25) -> R:R = 2.5
+	}
+	resRR, err := svc.PreTradeCheck(context.Background(), "31372e69-2088-45d8-a2d8-8607a58e3685", reqWithRR)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resRR.RiskRewardRatio != 2.5 {
+		t.Errorf("expected R:R 2.5, got %.2f", resRR.RiskRewardRatio)
+	}
+	if resRR.RiskScore <= 0 || resRR.RiskScore > 100 {
+		t.Errorf("expected valid risk score between 1 and 100, got %d", resRR.RiskScore)
+	}
+
+	// Test Circuit Limit Breach & Wishful Thinking Bias on RELIANCE
+	reqCircuitBreach := dto.PreTradeCheckRequest{
+		Symbol:        "RELIANCE",
+		Side:          "BUY",
+		Product:       "INTRADAY",
+		Type:          "LIMIT",
+		Quantity:      50,
+		PricePaise:    298550,  // ₹2,985.50
+		StopLossPaise: 294500,  // ₹2,945.00
+		TargetPaise:   1000000, // ₹10,000.00 (+235% intraday)
+	}
+	resCB, err := svc.PreTradeCheck(context.Background(), "31372e69-2088-45d8-a2d8-8607a58e3685", reqCircuitBreach)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resCB.RiskLevel != "HIGH_RISK" {
+		t.Errorf("expected HIGH_RISK for +235%% intraday target, got %s", resCB.RiskLevel)
+	}
+	if resCB.RiskScore > 40 {
+		t.Errorf("expected safety score <= 40 for fantasy setup, got %d", resCB.RiskScore)
+	}
+	hasCircuitWarning := false
+	hasWishfulWarning := false
+	for _, w := range resCB.Warnings {
+		if strings.Contains(w, "Circuit Limit Breach") {
+			hasCircuitWarning = true
+		}
+		if strings.Contains(w, "Wishful Thinking Bias") {
+			hasWishfulWarning = true
+		}
+	}
+	if !hasCircuitWarning {
+		t.Errorf("expected circuit limit breach warning, got warnings: %v", resCB.Warnings)
+	}
+	if !hasWishfulWarning {
+		t.Errorf("expected wishful thinking bias warning, got warnings: %v", resCB.Warnings)
+	}
+}
+
+func TestMentorService_AccountContextAndEducationalDisclaimers(t *testing.T) {
+	cfg := &config.Config{
+		GeminiAPIKey: "",
+		GeminiModel:  "gemini-2.0-flash",
+	}
+	svc := New(cfg)
+	svc.OrderPreview = func(_ string, req orderDTO.CreateOrderRequest) (*orderService.OrderPreview, error) {
+		return &orderService.OrderPreview{RequiredFundsPaise: 2500000, AvailableBalancePaise: 100000000, SufficientFunds: true}, nil
+	}
+
+	// Test educational disclaimer and live account context on portfolio risk query
+	ans, err := svc.Analyze(context.Background(), "31372e69-2088-45d8-a2d8-8607a58e3685", "How do I manage my portfolio risk and open positions?")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedElements := []string{
+		"Institutional Portfolio Risk Diagnostic",
+		"Live Account Context",
+		"Available Balance",
+		"Blocked Margin",
+		"Educational Notice:",
+		"simulator educational guidance only",
+	}
+
+	for _, elem := range expectedElements {
+		if !strings.Contains(ans, elem) {
+			t.Errorf("expected response to contain %q, got:\n%s", elem, ans)
+		}
+	}
+
+	// Test hedging query with context
+	ansHedge, err := svc.Analyze(context.Background(), "31372e69-2088-45d8-a2d8-8607a58e3685", "How can I hedge my exposure?")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(ansHedge, "Hedging Framework & Risk Mitigation") {
+		t.Errorf("expected hedging response, got:\n%s", ansHedge)
+	}
+	if !strings.Contains(ansHedge, "Educational Notice:") {
+		t.Errorf("expected educational notice in hedge response, got:\n%s", ansHedge)
+	}
+}
+
+func TestMentorService_Critique_ZeroTradesCleanSlate(t *testing.T) {
+	cfg := &config.Config{
+		GeminiAPIKey: "",
+		GeminiModel:  "gemini-2.0-flash",
+	}
+	svc := New(cfg)
+	svc.OrderPreview = func(_ string, req orderDTO.CreateOrderRequest) (*orderService.OrderPreview, error) {
+		return &orderService.OrderPreview{RequiredFundsPaise: 2500000, AvailableBalancePaise: 100000000, SufficientFunds: true}, nil
+	}
+
+	metrics := dto.CritiqueMetrics{
+		WinRate:                66.7,
+		ConcentrationRisk:      "LOW",
+		LeverageRisk:           "SAFE",
+		RevengeTradingDetected: false,
+		LimitOrderUsagePct:     0.0,
+		TotalTradesEvaluated:   0,
+		RealizedPnlPaise:       0,
+	}
+
+	critique := svc.buildRuleBasedCritique(100, "EXCELLENT", "A+", metrics, "")
+	if !strings.Contains(critique, "Clean Trading Slate") {
+		t.Errorf("expected clean trading slate onboarding critique for 0 trades, got:\n%s", critique)
+	}
+	if !strings.Contains(critique, "Trader Discipline Grade: A+ — EXCELLENT (100 / 100)") {
+		t.Errorf("expected A+ grade for clean slate, got:\n%s", critique)
+	}
+	if !strings.Contains(critique, "Disclaimer: Educational trade simulation critique only") {
+		t.Errorf("expected educational disclaimer in critique, got:\n%s", critique)
+	}
+}
+
+func TestMentorService_PreTradeCheck_DirectionalErrors(t *testing.T) {
+	cfg := &config.Config{
+		GeminiAPIKey: "",
+		GeminiModel:  "gemini-2.0-flash",
+	}
+	svc := New(cfg)
+	svc.OrderPreview = func(_ string, req orderDTO.CreateOrderRequest) (*orderService.OrderPreview, error) {
+		return &orderService.OrderPreview{RequiredFundsPaise: 2500000, AvailableBalancePaise: 100000000, SufficientFunds: true}, nil
+	}
+
+	// BUY order where Stop-Loss is ABOVE price (invalid direction)
+	req := dto.PreTradeCheckRequest{
+		Symbol:        "TCS",
+		Side:          "BUY",
+		Product:       "INTRADAY",
+		Type:          "LIMIT",
+		Quantity:      10,
+		PricePaise:    400000, // ₹4,000.00
+		StopLossPaise: 420000, // ₹4,200.00 (higher than entry -> error!)
+		TargetPaise:   380000, // ₹3,800.00 (lower than entry -> error!)
+	}
+
+	res, err := svc.PreTradeCheck(context.Background(), "31372e69-2088-45d8-a2d8-8607a58e3685", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	hasInvalidSL := false
+	hasInvalidTarget := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "Invalid Stop-Loss Order") {
+			hasInvalidSL = true
+		}
+		if strings.Contains(w, "Invalid Target Order") {
+			hasInvalidTarget = true
+		}
+	}
+
+	if !hasInvalidSL {
+		t.Errorf("expected warning about invalid stop-loss direction, got: %v", res.Warnings)
+	}
+	if !hasInvalidTarget {
+		t.Errorf("expected warning about invalid target direction, got: %v", res.Warnings)
+	}
+}
+
+type rejectingGeminiTransport struct{}
+
+func (rejectingGeminiTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"invalid test key"}}`)), Request: req}, nil
+}
+
+func TestMentorService_FallbackOnInvalidApiKey(t *testing.T) {
+	// Provide a fake/unreachable API key to verify it doesn't crash or error out,
+	// but gracefully falls back to the rule-based trade-aware engine
+	cfg := &config.Config{
+		GeminiAPIKey: "AIzaSyFakeKeyThatFails400Or403",
+		GeminiModel:  "gemini-2.0-flash",
+	}
+	svc := New(cfg)
+	svc.client = &http.Client{Transport: rejectingGeminiTransport{}} // no external network or data transfer
+	svc.OrderPreview = func(_ string, req orderDTO.CreateOrderRequest) (*orderService.OrderPreview, error) {
+		return &orderService.OrderPreview{RequiredFundsPaise: 2500000, AvailableBalancePaise: 100000000, SufficientFunds: true}, nil
+	}
+
+	ans, err := svc.Analyze(context.Background(), "31372e69-2088-45d8-a2d8-8607a58e3685", "What happens during 15:20 MIS square-off?")
+	if err != nil {
+		t.Fatalf("expected graceful fallback, got error: %v", err)
+	}
+
+	if !strings.Contains(ans, "MIS (Margin Intraday Square-off) Rules") {
+		t.Errorf("expected rule-based fallback response, got:\n%s", ans)
+	}
+}

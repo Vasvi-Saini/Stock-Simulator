@@ -1,0 +1,692 @@
+"use client";
+
+import { useState, useMemo } from "react";
+import Link from "next/link";
+import { useQuery } from "@tanstack/react-query";
+import {
+  Newspaper,
+  TrendingUp,
+  TrendingDown,
+  ExternalLink,
+  Search,
+  RefreshCw,
+  Clock,
+  ArrowUpRight,
+  ArrowDownRight,
+  Sparkles,
+  Info,
+  X,
+  Activity,
+  ChevronRight,
+  AlertTriangle,
+  Filter,
+} from "lucide-react";
+import Navbar from "@/components/layout/Navbar";
+import { publicFetch } from "@/lib/api";
+import type { Article } from "@/types";
+
+const TRENDING_SYMBOLS = [
+  "NIFTY",
+  "BANKNIFTY",
+  "RELIANCE",
+  "HDFCBANK",
+  "TCS",
+  "INFY",
+  "TATAMOTORS",
+  "ZOMATO",
+  "TATASTEEL",
+];
+
+const SECTORS = [
+  "ALL",
+  "BANKING",
+  "IT",
+  "ENERGY",
+  "AUTO",
+  "MACRO",
+  "METALS",
+  "PHARMA",
+];
+
+function formatTimeAgo(isoString: string): string {
+  try {
+    if (!isoString || !Number.isFinite(Date.parse(isoString))) return "Publication time unavailable";
+    const diffMs = Date.now() - new Date(isoString).getTime();
+    if (diffMs < 0) return "Just now";
+    const minutes = Math.floor(diffMs / (1000 * 60));
+    if (minutes < 1) return "Just now";
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  } catch {
+    return "Recent";
+  }
+}
+
+export default function NewsDeskPage() {
+  const [sentimentFilter, setSentimentFilter] = useState<"ALL" | "POSITIVE" | "NEGATIVE" | "NEUTRAL">("ALL");
+  const [selectedSector, setSelectedSector] = useState<string>("ALL");
+  const [selectedSymbol, setSelectedSymbol] = useState<string>("");
+  const [searchQuery, setSearchQuery] = useState<string>("");
+
+  // Fetch News from Backend Go API
+  const {
+    data: articles = [],
+    isLoading,
+    isRefetching,
+    isError,
+    refetch,
+  } = useQuery<Article[]>({
+    queryKey: ["news-desk", selectedSymbol],
+    queryFn: () => {
+      const param = selectedSymbol ? `?symbol=${encodeURIComponent(selectedSymbol)}&limit=50` : `?limit=50`;
+      return publicFetch<Article[]>(`/news${param}`);
+    },
+    refetchInterval: 30000,
+    staleTime: 15000,
+  });
+
+  const {data: ingestion, isError: ingestionError} = useQuery<{status: string}>({
+    queryKey: ["news-ingestion-status"], queryFn: () => publicFetch("/news/status"), refetchInterval: 30000, retry: false,
+  });
+
+  const effectiveArticles = useMemo(() => {
+    return articles || [];
+  }, [articles]);
+
+  // Calculate Sentiment Barometer Statistics
+  const stats = useMemo(() => {
+    if (isError || effectiveArticles.length === 0) {
+      return {
+        total: 0,
+        positive: 0,
+        negative: 0,
+        neutral: 0,
+        posPct: 0,
+        negPct: 0,
+        neuPct: 0,
+        avgScore: "—",
+        bias: "AWAITING FEED",
+        isAvailable: false,
+      };
+    }
+
+    let positive = 0;
+    let negative = 0;
+    let neutral = 0;
+    let totalScore = 0;
+
+    effectiveArticles.forEach((a) => {
+      if (a.sentiment === "POSITIVE") positive++;
+      else if (a.sentiment === "NEGATIVE") negative++;
+      else neutral++;
+      totalScore += a.score || 0;
+    });
+
+    const total = effectiveArticles.length;
+    const posPct = Math.round((positive / total) * 100);
+    const negPct = Math.round((negative / total) * 100);
+    const neuPct = Math.max(0, 100 - posPct - negPct);
+    const avgScore = (totalScore / total).toFixed(1);
+
+    return {
+      total: effectiveArticles.length,
+      positive,
+      negative,
+      neutral,
+      posPct,
+      negPct,
+      neuPct,
+      avgScore,
+      bias:
+        positive > negative
+          ? "BULLISH BIAS"
+          : negative > positive
+          ? "BEARISH BIAS"
+          : "BALANCED / NEUTRAL",
+      isAvailable: true,
+    };
+  }, [effectiveArticles, isError]);
+
+  // Client-side Filtered Articles
+  const filteredArticles = useMemo(() => {
+    return effectiveArticles.filter((a) => {
+      // 1. Sentiment filter
+      if (sentimentFilter !== "ALL" && a.sentiment !== sentimentFilter) {
+        return false;
+      }
+
+      // 2. Sector filter
+      if (selectedSector !== "ALL") {
+        const hasSector = a.sectors && a.sectors.includes(selectedSector);
+        if (!hasSector) return false;
+      }
+
+      // 3. Search query
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase().trim();
+        const matchesTitle = a.title.toLowerCase().includes(q);
+        const matchesSource = a.source.toLowerCase().includes(q);
+        const matchesSymbol =
+          a.symbols && a.symbols.some((s) => s.toLowerCase().includes(q));
+        if (!matchesTitle && !matchesSource && !matchesSymbol) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }, [effectiveArticles, sentimentFilter, selectedSector, searchQuery]);
+
+  return (
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-white">
+      <Navbar />
+
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        {/* ------------------------------------------------------------------ */}
+        {/* 1. HEADER & LIVE FEED STATUS */}
+        {/* ------------------------------------------------------------------ */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-200 dark:border-slate-800/80 pb-6">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold tracking-wider uppercase bg-cyan-100/80 dark:bg-cyan-950/80 text-cyan-800 dark:text-cyan-400 border border-cyan-200 dark:border-cyan-800/60 flex items-center gap-1.5">
+                <Activity className="w-3 h-3 text-cyan-600 dark:text-cyan-400 animate-pulse" />
+                News ingestion: {isLoading ? "CONNECTING..." : isError ? "FEED ERROR" : (ingestionError ? "OFFLINE" : (ingestion?.status ?? (effectiveArticles.length > 0 || selectedSymbol ? "LIVE WIRE" : "STANDBY")))}
+              </span>
+              <span className="text-xs text-slate-500 dark:text-slate-400 font-mono">
+                Lexical Sentiment Classifier
+              </span>
+            </div>
+            <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 dark:text-white tracking-tight flex items-center gap-2">
+              Indian Financial News Desk
+            </h1>
+            <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 mt-1 max-w-2xl">
+              Real-time aggregation from verified Indian financial press feeds, transparent lexical scoring, and continuous stock ticker symbol mapping.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => refetch()}
+              disabled={isLoading || isRefetching}
+              className="px-3.5 py-2 rounded-xl bg-white hover:bg-slate-50 dark:bg-slate-900 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-800 text-xs font-bold transition-all flex items-center gap-2 cursor-pointer shadow-xs"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 text-cyan-600 dark:text-cyan-400 ${
+                  isRefetching ? "animate-spin" : ""
+                }`}
+              />
+              <span>Refresh Feed</span>
+            </button>
+
+            <Link
+              href="/stocks"
+              className="px-3.5 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition-all flex items-center gap-1.5 shadow-md shadow-cyan-600/20"
+            >
+              <TrendingUp className="w-3.5 h-3.5" />
+              <span>Explore Stocks</span>
+            </Link>
+          </div>
+        </div>
+
+        {/* ------------------------------------------------------------------ */}
+        {/* 2. MARKET SENTIMENT BAROMETER */}
+        {/* ------------------------------------------------------------------ */}
+        {isLoading ? (
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            {[1, 2, 3, 4].map((i) => (
+              <div
+                key={i}
+                className="p-4 rounded-2xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-xs animate-pulse space-y-3"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="h-3.5 w-24 bg-slate-200 dark:bg-slate-800 rounded" />
+                  <div className="h-3.5 w-3.5 bg-slate-200 dark:bg-slate-800 rounded-full" />
+                </div>
+                <div className="h-7 w-28 bg-slate-200 dark:bg-slate-800 rounded mt-2" />
+                <div className="h-2 w-full bg-slate-100 dark:bg-slate-800/60 rounded-full" />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          {/* Card 1: Aggregate Market Sentiment */}
+          <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-xs flex flex-col justify-between">
+            <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 font-semibold mb-2">
+              <span>Overall Sentiment</span>
+              <Sparkles className="w-3.5 h-3.5 text-cyan-600 dark:text-cyan-400" />
+            </div>
+            <div>
+              <div
+                className={`text-lg font-extrabold font-mono flex items-center gap-1.5 ${
+                  !stats.isAvailable
+                    ? "text-slate-500 dark:text-slate-400"
+                    : stats.bias === "BULLISH BIAS"
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : stats.bias === "BEARISH BIAS"
+                    ? "text-rose-600 dark:text-rose-400"
+                    : "text-slate-800 dark:text-slate-300"
+                }`}
+              >
+                {stats.isAvailable && stats.bias === "BULLISH BIAS" && (
+                  <ArrowUpRight className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
+                )}
+                {stats.isAvailable && stats.bias === "BEARISH BIAS" && (
+                  <ArrowDownRight className="w-5 h-5 text-rose-600 dark:text-rose-400" />
+                )}
+                <span>{stats.isAvailable ? stats.bias : "AWAITING FEED"}</span>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 font-mono">
+                {stats.isAvailable
+                  ? `Net Score: ${stats.avgScore} across ${stats.total} headlines`
+                  : "Sentiment classification unavailable"}
+              </p>
+            </div>
+          </div>
+
+          {/* Card 2: Bullish Articles */}
+          <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/60 border border-emerald-200/90 dark:border-slate-800/80 shadow-xs">
+            <div className="flex items-center justify-between text-xs font-semibold mb-2">
+              <span className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400">
+                <TrendingUp className="w-3.5 h-3.5" /> Positive / Bullish
+              </span>
+              <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                {stats.isAvailable ? `${stats.posPct}%` : "—"}
+              </span>
+            </div>
+            <div className="text-2xl font-black font-mono text-slate-900 dark:text-white mb-2">
+              {stats.isAvailable ? stats.positive : "—"}
+            </div>
+            <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
+              <div
+                className="bg-emerald-500 h-1.5 rounded-full transition-all duration-500"
+                style={{ width: `${stats.posPct}%` }}
+              />
+            </div>
+          </div>
+
+          {/* Card 3: Neutral Articles */}
+          <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800/80 shadow-xs">
+            <div className="flex items-center justify-between text-xs font-semibold mb-2">
+              <span className="flex items-center gap-1.5 text-slate-600 dark:text-slate-300">
+                <Clock className="w-3.5 h-3.5" /> Neutral / Macro
+              </span>
+              <span className="font-mono font-bold text-slate-600 dark:text-slate-300">
+                {stats.isAvailable ? `${stats.neuPct}%` : "—"}
+              </span>
+            </div>
+            <div className="text-2xl font-black font-mono text-slate-900 dark:text-white mb-2">
+              {stats.isAvailable ? stats.neutral : "—"}
+            </div>
+            <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
+              <div
+                className="bg-slate-400 dark:bg-slate-500 h-1.5 rounded-full transition-all duration-500"
+                style={{ width: `${stats.neuPct}%` }}
+              />
+            </div>
+          </div>
+
+          {/* Card 4: Bearish Articles */}
+          <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/60 border border-rose-200/90 dark:border-slate-800/80 shadow-xs">
+            <div className="flex items-center justify-between text-xs font-semibold mb-2">
+              <span className="flex items-center gap-1.5 text-rose-700 dark:text-rose-400">
+                <TrendingDown className="w-3.5 h-3.5" /> Negative / Bearish
+              </span>
+              <span className="font-mono font-bold text-rose-600 dark:text-rose-400">
+                {stats.isAvailable ? `${stats.negPct}%` : "—"}
+              </span>
+            </div>
+            <div className="text-2xl font-black font-mono text-slate-900 dark:text-white mb-2">
+              {stats.isAvailable ? stats.negative : "—"}
+            </div>
+            <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
+              <div
+                className="bg-rose-500 h-1.5 rounded-full transition-all duration-500"
+                style={{ width: `${stats.negPct}%` }}
+              />
+            </div>
+          </div>
+          </div>
+        )}
+
+        {/* ------------------------------------------------------------------ */}
+        {/* 3. FILTERS, SEARCH & TRENDING TICKERS */}
+        {/* ------------------------------------------------------------------ */}
+        <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/40 border border-slate-200 dark:border-slate-800/80 shadow-xs space-y-3">
+          {/* Top Row: Search & Sentiment Filter Tabs */}
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+            {/* Search Input */}
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-slate-400 dark:text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search headlines, companies, publishers, or symbols..."
+                className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl pl-9 pr-8 py-2 text-xs text-slate-900 dark:text-slate-200 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-hidden focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-colors font-mono"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery("")}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 dark:text-slate-500 dark:hover:text-slate-300 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* Sentiment Filter Tabs */}
+            <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-950 p-1 rounded-xl border border-slate-200 dark:border-slate-800 shrink-0">
+              {(["ALL", "POSITIVE", "NEGATIVE", "NEUTRAL"] as const).map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => setSentimentFilter(s)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    sentimentFilter === s
+                      ? s === "POSITIVE"
+                        ? "bg-emerald-100 text-emerald-800 border border-emerald-300 dark:bg-emerald-950 dark:text-emerald-300 dark:border-emerald-800 shadow-xs"
+                        : s === "NEGATIVE"
+                        ? "bg-rose-100 text-rose-800 border border-rose-300 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-800 shadow-xs"
+                        : "bg-white text-cyan-800 border border-slate-200 dark:bg-slate-800 dark:text-cyan-300 dark:border-slate-700 shadow-xs"
+                      : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
+                  }`}
+                >
+                  {s === "ALL" ? "All Sentiments" : s}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Bottom Row: Sector Filter & Trending Symbol Chips */}
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 dark:border-slate-800/60">
+            {/* Sector Chips */}
+            <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none py-1">
+              <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase mr-1">
+                Sector:
+              </span>
+              {SECTORS.map((sec) => (
+                <button
+                  key={sec}
+                  type="button"
+                  onClick={() => setSelectedSector(sec)}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-mono font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                    selectedSector === sec
+                      ? "bg-cyan-50 text-cyan-800 border border-cyan-300 dark:bg-cyan-500/20 dark:text-cyan-300 dark:border-cyan-500/40 shadow-xs font-bold"
+                      : "bg-slate-100 hover:bg-slate-200/70 text-slate-600 hover:text-slate-900 dark:bg-slate-950 dark:text-slate-400 dark:hover:text-slate-200 border border-slate-200 dark:border-slate-800/80"
+                  }`}
+                >
+                  {sec}
+                </button>
+              ))}
+            </div>
+
+            {/* Active Symbol Filter Chip (if selected) */}
+            {selectedSymbol && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-500 dark:text-slate-400">Filtering Symbol:</span>
+                <span className="px-2.5 py-1 rounded-lg bg-cyan-50 text-cyan-800 dark:bg-cyan-950 dark:text-cyan-300 font-mono font-bold text-xs border border-cyan-200 dark:border-cyan-800 flex items-center gap-1.5 shadow-xs">
+                  {selectedSymbol}
+                  <button
+                    type="button"
+                    onClick={() => setSelectedSymbol("")}
+                    className="hover:text-cyan-950 dark:hover:text-white cursor-pointer"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Quick Trending Counters */}
+          <div className="flex items-center gap-2 overflow-x-auto scrollbar-none pt-1">
+            <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase shrink-0">
+              Trending Counters:
+            </span>
+            {TRENDING_SYMBOLS.map((sym) => (
+              <button
+                key={sym}
+                type="button"
+                onClick={() => setSelectedSymbol(selectedSymbol === sym ? "" : sym)}
+                className={`px-2 py-0.5 rounded text-[11px] font-mono font-bold transition-all cursor-pointer shrink-0 ${
+                  selectedSymbol === sym
+                    ? "bg-cyan-600 text-white font-black shadow-xs"
+                    : "bg-slate-100 hover:bg-slate-200/80 text-slate-700 hover:text-cyan-700 dark:bg-slate-950 dark:text-slate-400 dark:hover:text-cyan-300 border border-slate-200 dark:border-slate-800"
+                }`}
+              >
+                {sym}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* ------------------------------------------------------------------ */}
+        {/* 4. NEWS ARTICLES FEED */}
+        {/* ------------------------------------------------------------------ */}
+        <div className="space-y-3">
+          <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 px-1 font-mono">
+            <span>
+              {isLoading
+                ? "Connecting to market news stream..."
+                : `Showing ${filteredArticles.length} headline${filteredArticles.length !== 1 ? "s" : ""}`}
+            </span>
+            <span>Real-time polling: Every 30s</span>
+          </div>
+
+          {isLoading ? (
+            <div className="space-y-3">
+              {[1, 2, 3, 4, 5].map((i) => (
+                <div
+                  key={i}
+                  className="p-4 sm:p-5 rounded-2xl bg-white dark:bg-slate-900/50 border border-slate-200 dark:border-slate-800/80 shadow-xs animate-pulse flex flex-col md:flex-row md:items-center justify-between gap-4"
+                >
+                  <div className="flex-1 space-y-2.5">
+                    <div className="flex items-center gap-2">
+                      <div className="h-4 w-24 bg-slate-200 dark:bg-slate-800 rounded" />
+                      <div className="h-3 w-16 bg-slate-200 dark:bg-slate-800 rounded" />
+                      <div className="h-3 w-12 bg-slate-200 dark:bg-slate-800 rounded" />
+                    </div>
+                    <div className="h-5 w-4/5 bg-slate-200 dark:bg-slate-800 rounded" />
+                    <div className="h-4 w-1/2 bg-slate-200 dark:bg-slate-800 rounded" />
+                    <div className="flex items-center gap-2 pt-1">
+                      <div className="h-4 w-16 bg-slate-200 dark:bg-slate-800 rounded" />
+                      <div className="h-4 w-16 bg-slate-200 dark:bg-slate-800 rounded" />
+                    </div>
+                  </div>
+                  <div className="h-8 w-24 bg-slate-200 dark:bg-slate-800 rounded-xl shrink-0" />
+                </div>
+              ))}
+            </div>
+          ) : isError ? (
+            <div className="p-12 text-center rounded-2xl bg-white dark:bg-slate-900/40 border border-rose-200 dark:border-rose-900/60 space-y-3 shadow-xs">
+              <AlertTriangle className="w-10 h-10 text-rose-500 mx-auto" />
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">News Feed Connection Error</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                Failed to retrieve live headlines from the news backend. Please check your network connection or try refreshing.
+              </p>
+              <button
+                type="button"
+                onClick={() => refetch()}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold transition-colors cursor-pointer"
+              >
+                Retry Feed Connection
+              </button>
+            </div>
+          ) : effectiveArticles.length === 0 && selectedSymbol ? (
+            <div className="p-12 text-center rounded-2xl bg-white dark:bg-slate-900/30 border border-slate-200 dark:border-slate-800/80 space-y-3 shadow-xs">
+              <Newspaper className="w-10 h-10 text-slate-400 dark:text-slate-600 mx-auto" />
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                No recent headlines found for {selectedSymbol}
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                No articles mentioning {selectedSymbol} are present in the current aggregation buffer. Clear the symbol filter to view all market news.
+              </p>
+              <button
+                type="button"
+                onClick={() => setSelectedSymbol("")}
+                className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition-colors cursor-pointer"
+              >
+                Clear Symbol Filter
+              </button>
+            </div>
+          ) : effectiveArticles.length === 0 ? (
+            <div className="p-12 text-center rounded-2xl bg-white dark:bg-slate-900/30 border border-slate-200 dark:border-slate-800/80 space-y-3 shadow-xs">
+              <Newspaper className="w-10 h-10 text-slate-400 dark:text-slate-600 mx-auto" />
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">News Ingestion Standby</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                No articles currently in the aggregation buffer. Live market news ingest worker runs continuously.
+              </p>
+              <button
+                type="button"
+                onClick={() => refetch()}
+                className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-xs font-bold text-slate-800 dark:text-slate-200 transition-colors cursor-pointer"
+              >
+                Refresh Buffer
+              </button>
+            </div>
+          ) : filteredArticles.length === 0 ? (
+            <div className="p-12 text-center rounded-2xl bg-white dark:bg-slate-900/30 border border-slate-200 dark:border-slate-800/80 space-y-3 shadow-xs">
+              <Filter className="w-10 h-10 text-slate-400 dark:text-slate-600 mx-auto" />
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">No articles matched your filters</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                No financial news currently matches your selected filters across the active {effectiveArticles.length} headlines.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setSentimentFilter("ALL");
+                  setSelectedSector("ALL");
+                  setSelectedSymbol("");
+                  setSearchQuery("");
+                }}
+                className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-xs font-bold text-slate-800 dark:text-slate-200 transition-colors cursor-pointer"
+              >
+                Reset All Filters
+              </button>
+            </div>
+          ) : (
+            filteredArticles.map((article, idx) => {
+              const isPositive = article.sentiment === "POSITIVE";
+              const isNegative = article.sentiment === "NEGATIVE";
+
+              return (
+                <div
+                  key={`${article.url}-${idx}`}
+                  className="p-4 sm:p-5 rounded-2xl bg-white hover:bg-slate-50/80 dark:bg-slate-900/50 dark:hover:bg-slate-900/80 border border-slate-200 hover:border-slate-300 dark:border-slate-800/80 dark:hover:border-slate-700 transition-all duration-200 group flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-xs"
+                >
+                  <div className="flex-1 space-y-2 min-w-0">
+                    {/* Top Metadata Row: Source & Timestamp */}
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-bold text-cyan-700 dark:text-cyan-400 px-2 py-0.5 rounded bg-cyan-50 dark:bg-cyan-950/60 border border-cyan-200 dark:border-cyan-800/50">
+                        {article.source}
+                      </span>
+
+                      <span className="text-slate-500 dark:text-slate-400 flex items-center gap-1 font-mono">
+                        <Clock className="w-3 h-3" />
+                        {formatTimeAgo(article.published_at)}
+                      </span>
+
+                      {/* Sector Tag */}
+                      {article.sectors && article.sectors.length > 0 && (
+                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-mono uppercase">
+                          {article.sectors[0]}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Headline Title */}
+                    <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-white group-hover:text-cyan-700 dark:group-hover:text-cyan-300 transition-colors leading-snug">
+                      <a
+                        href={article.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-start gap-1.5 hover:underline"
+                      >
+                        <span>{article.title}</span>
+                        <ExternalLink className="w-3.5 h-3.5 text-slate-400 group-hover:text-cyan-600 dark:group-hover:text-cyan-400 shrink-0 mt-1 opacity-70 group-hover:opacity-100" />
+                      </a>
+                    </h3>
+
+                    {/* Stock Symbol Tags */}
+                    {article.symbols && article.symbols.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                        <span className="text-[10px] text-slate-500 font-mono">
+                          Impacted:
+                        </span>
+                        {article.symbols.map((sym) => (
+                          <div key={sym} className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => setSelectedSymbol(sym)}
+                              className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 dark:bg-slate-950 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-300 hover:text-cyan-700 dark:hover:text-cyan-300 border border-slate-200 dark:border-slate-800 text-[11px] font-mono font-bold transition-colors cursor-pointer"
+                              title={`Filter news for ${sym}`}
+                            >
+                              {sym}
+                            </button>
+
+                            <Link
+                              href={`/stocks/${encodeURIComponent(sym)}`}
+                              className="p-1 rounded bg-slate-100 hover:cyan-100 dark:bg-slate-950 dark:hover:bg-cyan-950 text-slate-500 hover:text-cyan-700 dark:text-slate-400 dark:hover:text-cyan-300 border border-slate-200 dark:border-slate-800 transition-colors text-[10px]"
+                              title={`View & Trade ${sym}`}
+                            >
+                              <TrendingUp className="w-3 h-3" />
+                            </Link>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Right Column: Sentiment Badge & Lexical Score */}
+                  <div className="flex md:flex-col items-center md:items-end justify-between shrink-0 gap-2 pt-2 md:pt-0 border-t md:border-t-0 border-slate-100 dark:border-slate-800/60">
+                    <div
+                      className={`px-3 py-1 rounded-xl text-xs font-mono font-bold flex items-center gap-1.5 border shadow-xs ${
+                        isPositive
+                          ? "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-800/60"
+                          : isNegative
+                          ? "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/80 dark:text-rose-400 dark:border-rose-800/60"
+                          : "bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:border-slate-700"
+                      }`}
+                    >
+                      {isPositive && <ArrowUpRight className="w-3.5 h-3.5 stroke-[2.5]" />}
+                      {isNegative && <ArrowDownRight className="w-3.5 h-3.5 stroke-[2.5]" />}
+                      <span>{article.sentiment}</span>
+                      <span className="text-[10px] px-1 py-0.2 rounded bg-black/10 dark:bg-black/30 opacity-90">
+                        {article.score > 0 ? `+${article.score}` : article.score}
+                      </span>
+                    </div>
+
+                    <a
+                      href={article.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs text-slate-600 hover:text-cyan-700 dark:text-slate-400 dark:hover:text-cyan-300 font-semibold flex items-center gap-1 transition-colors"
+                    >
+                      <span>Read Source</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </a>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* ------------------------------------------------------------------ */}
+        {/* 5. EDUCATIONAL & REGULATORY COMPLIANCE BANNER */}
+        {/* ------------------------------------------------------------------ */}
+        <div className="p-4 rounded-xl bg-white dark:bg-slate-900/40 border border-slate-200 dark:border-slate-800/60 flex items-start gap-3 text-xs text-slate-500 dark:text-slate-400 shadow-xs">
+          <Info className="w-4 h-4 text-slate-400 dark:text-slate-500 shrink-0 mt-0.5" />
+          <p>
+            <strong className="text-slate-700 dark:text-slate-300">Disclaimer:</strong> Headline sentiment is classified automatically via financial lexical heuristics for educational paper-trading simulations. These indicators are not curated financial advice, investment recommendations, or buy/sell signals. Always conduct independent fundamental and technical diligence.
+          </p>
+        </div>
+      </main>
+    </div>
+  );
+}

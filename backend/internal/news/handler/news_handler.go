@@ -1,0 +1,56 @@
+package handler
+
+import (
+	"errors"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/cache"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/news/service"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/pkg/response"
+	"github.com/gin-gonic/gin"
+)
+
+type NewsHandler struct{ service *service.NewsService }
+
+func New(redisURL string, timeout time.Duration) (*NewsHandler, error) {
+	newsService, err := service.New(redisURL, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return &NewsHandler{service: newsService}, nil
+}
+
+func (h *NewsHandler) List(c *gin.Context) {
+	limit := 20
+	if rawLimit := c.Query("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil {
+			response.Error(c, http.StatusBadRequest, "limit must be a number", nil)
+			return
+		}
+		limit = parsed
+	}
+	symbol := c.Query("symbol")
+	sentiment := c.Query("sentiment")
+	articles, err := h.service.ListWithFilters(symbol, sentiment, limit)
+	if err != nil {
+		if errors.Is(err, cache.ErrUnavailable) {
+			response.Error(c, http.StatusServiceUnavailable, "News temporarily unavailable", nil)
+			return
+		}
+		response.Error(c, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+	response.Success(c, http.StatusOK, "News retrieved successfully", articles)
+}
+
+func (h *NewsHandler) Status(c *gin.Context) {
+	status, err := h.service.Status()
+	if err != nil {
+		response.Error(c, http.StatusServiceUnavailable, "News ingestion status unavailable", nil)
+		return
+	}
+	response.Success(c, http.StatusOK, "News ingestion status", status)
+}

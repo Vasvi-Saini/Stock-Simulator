@@ -1,0 +1,41 @@
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "node --import tsx --test src/lib/*.test.*",
+    "test:e2e": "playwright test",
+    "measure:home": "node scripts/measure-homepage.mjs",
+    "profile:device": "node scripts/capture-mobile-trace.mjs",
+    "profile:mobile": "node scripts/profile-mobile.mjs",
+    "test:standalone": "node scripts/smoke-standalone.mjs"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.103.1",
+    "@vercel/speed-insights": "^2.0.0",
+    "lightweight-charts": "^5.2.1",
+    "lucide-react": "^1.46.0",
+    "next": "16.4.0",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tailwindcss/postcss": "^4",
+    "@tanstack/react-query-devtools": "^5.103.1",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "babel-plugin-react-compiler": "1.0.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.0",
+    "tailwindcss": "^4",
+    "tsx": "4.20.6",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,354 @@
+package handler
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/config"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/calendar"
+	marketDTO "github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/dto"
+	marketService "github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/service"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/model"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/order/dto"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/pkg/response"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+func init() {
+	gin.SetMode(gin.TestMode)
+}
+
+func setupOrderTestRouter(h *OrderHandler, userID string) *gin.Engine {
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		reqID := c.GetHeader("X-Request-ID")
+		if reqID == "" {
+			reqID = "test-req-12345"
+		}
+		c.Set("request_id", reqID)
+		c.Header("X-Request-ID", reqID)
+		c.Next()
+	})
+	r.POST("/api/v1/orders", func(c *gin.Context) {
+		c.Set("user_id", userID)
+		h.Create(c)
+	})
+	r.POST("/api/v1/orders/:id/execute", func(c *gin.Context) {
+		c.Set("user_id", userID)
+		h.Execute(c)
+	})
+	r.POST("/api/v1/portfolio/positions/:uuid/squareoff", func(c *gin.Context) {
+		c.Set("user_id", userID)
+		h.SquareOffPosition(c)
+	})
+	return r
+}
+
+func TestOrderHandler_ErrorSemantics(t *testing.T) {
+	loc := calendar.Location()
+	tradingTime := time.Date(2026, 9, 16, 11, 0, 0, 0, loc)
+	userID := uuid.New().String()
+
+	cfg := &config.Config{
+		MISLeverage:             5,
+		FuturesMarginPercent:    20,
+		OptionSellMarginPercent: 30,
+	}
+
+	t.Run("Returns 404 INSTRUMENT_NOT_FOUND when instrument master lookup fails", func(t *testing.T) {
+		h := New(nil, cfg)
+		h.Service().SetCreateOrderFunc(func(order *model.Order) error { return nil })
+		h.Service().SetNowFunc(func() time.Time { return tradingTime })
+		h.Service().SetInstrumentFinder(func(symbol string) (*model.Instrument, error) {
+			return nil, nil // unknown instrument
+		})
+
+		r := setupOrderTestRouter(h, userID)
+		body, _ := json.Marshal(dto.CreateOrderRequest{
+			Symbol:   "UNKNOWN_STOCK",
+			Side:     model.OrderSideBuy,
+			Type:     model.OrderTypeMarket,
+			Product:  model.OrderProductDelivery,
+			Quantity: 10,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/orders", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "test-intent")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &apiResp)
+		if apiResp.Errors != "INSTRUMENT_NOT_FOUND" {
+			t.Fatalf("expected error code INSTRUMENT_NOT_FOUND, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("Returns 404 QUOTE_NOT_FOUND when market quote is not found", func(t *testing.T) {
+		h := New(nil, cfg)
+		h.Service().SetCreateOrderFunc(func(order *model.Order) error { return nil })
+		h.Service().SetNowFunc(func() time.Time { return tradingTime })
+		h.Service().SetInstrumentFinder(func(symbol string) (*model.Instrument, error) {
+			return &model.Instrument{
+				Active: true, IsTradable: true,
+				Symbol:          symbol,
+				ExchangeSegment: "NSE",
+				InstrumentType:  "EQUITY",
+				LotSize:         1,
+			}, nil
+		})
+		h.Service().SetExecutableQuoteFunc(func(symbol string) (*marketDTO.QuoteResponse, error) {
+			return nil, marketService.ErrQuoteNotFound
+		})
+
+		r := setupOrderTestRouter(h, userID)
+		body, _ := json.Marshal(dto.CreateOrderRequest{
+			Symbol:   "RELIANCE",
+			Side:     model.OrderSideBuy,
+			Type:     model.OrderTypeMarket,
+			Product:  model.OrderProductDelivery,
+			Quantity: 10,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/orders", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "test-intent")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &apiResp)
+		if apiResp.Errors != "QUOTE_NOT_FOUND" {
+			t.Fatalf("expected error code QUOTE_NOT_FOUND, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("Returns 400 QUOTE_STALE when market quote is stale", func(t *testing.T) {
+		h := New(nil, cfg)
+		h.Service().SetCreateOrderFunc(func(order *model.Order) error { return nil })
+		h.Service().SetNowFunc(func() time.Time { return tradingTime })
+		h.Service().SetInstrumentFinder(func(symbol string) (*model.Instrument, error) {
+			return &model.Instrument{
+				Active: true, IsTradable: true,
+				Symbol:          symbol,
+				ExchangeSegment: "NSE",
+				InstrumentType:  "EQUITY",
+				LotSize:         1,
+			}, nil
+		})
+		h.Service().SetExecutableQuoteFunc(func(symbol string) (*marketDTO.QuoteResponse, error) {
+			return nil, marketService.ErrQuoteStale
+		})
+
+		r := setupOrderTestRouter(h, userID)
+		body, _ := json.Marshal(dto.CreateOrderRequest{
+			Symbol:   "RELIANCE",
+			Side:     model.OrderSideBuy,
+			Type:     model.OrderTypeMarket,
+			Product:  model.OrderProductDelivery,
+			Quantity: 10,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/orders", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "test-intent")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &apiResp)
+		if apiResp.Errors != "QUOTE_STALE" {
+			t.Fatalf("expected error code QUOTE_STALE, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("Returns 400 QUOTE_INELIGIBLE when market quote source is ineligible", func(t *testing.T) {
+		h := New(nil, cfg)
+		h.Service().SetCreateOrderFunc(func(order *model.Order) error { return nil })
+		h.Service().SetNowFunc(func() time.Time { return tradingTime })
+		h.Service().SetInstrumentFinder(func(symbol string) (*model.Instrument, error) {
+			return &model.Instrument{
+				Active: true, IsTradable: true,
+				Symbol:          symbol,
+				ExchangeSegment: "NSE",
+				InstrumentType:  "EQUITY",
+				LotSize:         1,
+			}, nil
+		})
+		h.Service().SetExecutableQuoteFunc(func(symbol string) (*marketDTO.QuoteResponse, error) {
+			return nil, marketService.ErrQuoteIneligible
+		})
+
+		r := setupOrderTestRouter(h, userID)
+		body, _ := json.Marshal(dto.CreateOrderRequest{
+			Symbol:   "RELIANCE",
+			Side:     model.OrderSideBuy,
+			Type:     model.OrderTypeMarket,
+			Product:  model.OrderProductDelivery,
+			Quantity: 10,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/orders", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "test-intent")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &apiResp)
+		if apiResp.Errors != "QUOTE_INELIGIBLE" {
+			t.Fatalf("expected error code QUOTE_INELIGIBLE, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("Returns 503 MARKET_DATA_UNAVAILABLE when market service is down", func(t *testing.T) {
+		h := New(nil, cfg)
+		h.Service().SetCreateOrderFunc(func(order *model.Order) error { return nil })
+		h.Service().SetNowFunc(func() time.Time { return tradingTime })
+		h.Service().SetInstrumentFinder(func(symbol string) (*model.Instrument, error) {
+			return &model.Instrument{
+				Active: true, IsTradable: true,
+				Symbol:          symbol,
+				ExchangeSegment: "NSE",
+				InstrumentType:  "EQUITY",
+				LotSize:         1,
+			}, nil
+		})
+		h.Service().SetExecutableQuoteFunc(func(symbol string) (*marketDTO.QuoteResponse, error) {
+			return nil, marketService.ErrQuoteUnavailable
+		})
+
+		r := setupOrderTestRouter(h, userID)
+		body, _ := json.Marshal(dto.CreateOrderRequest{
+			Symbol:   "RELIANCE",
+			Side:     model.OrderSideBuy,
+			Type:     model.OrderTypeMarket,
+			Product:  model.OrderProductDelivery,
+			Quantity: 10,
+		})
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/orders", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "test-intent")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected status 503, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &apiResp)
+		if apiResp.Errors != "MARKET_DATA_UNAVAILABLE" {
+			t.Fatalf("expected error code MARKET_DATA_UNAVAILABLE, got %v", apiResp.Errors)
+		}
+		if apiResp.Code != "MARKET_DATA_UNAVAILABLE" {
+			t.Fatalf("expected Code field MARKET_DATA_UNAVAILABLE, got %v", apiResp.Code)
+		}
+		if apiResp.RequestID != "test-req-12345" {
+			t.Fatalf("expected RequestID test-req-12345, got %v", apiResp.RequestID)
+		}
+	})
+
+	t.Run("Returns 400 INVALID_POSITION_ID on malformed square-off UUID", func(t *testing.T) {
+		h := New(nil, cfg)
+		r := setupOrderTestRouter(h, userID)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/portfolio/positions/not-a-uuid/squareoff", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &apiResp)
+		if apiResp.Code != "INVALID_POSITION_ID" {
+			t.Fatalf("expected Code INVALID_POSITION_ID, got %v", apiResp.Code)
+		}
+		if apiResp.RequestID == "" {
+			t.Fatal("expected non-empty RequestID")
+		}
+	})
+
+	t.Run("Returns 400 EXECUTION_BODY_FORBIDDEN when body is sent to execute", func(t *testing.T) {
+		h := New(nil, cfg)
+		r := setupOrderTestRouter(h, userID)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/orders/"+uuid.NewString()+"/execute", bytes.NewReader([]byte(`{"price": 100}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "test-intent")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &apiResp)
+		if apiResp.Code != "EXECUTION_BODY_FORBIDDEN" {
+			t.Fatalf("expected Code EXECUTION_BODY_FORBIDDEN, got %v", apiResp.Code)
+		}
+	})
+
+	t.Run("Returns 503 DATABASE_UNAVAILABLE when database is not connected on execution", func(t *testing.T) {
+		h := New(nil, cfg)
+		r := setupOrderTestRouter(h, userID)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/orders/"+uuid.NewString()+"/execute", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected status 503, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &apiResp)
+		if apiResp.Code != "DATABASE_UNAVAILABLE" {
+			t.Fatalf("expected Code DATABASE_UNAVAILABLE, got %v", apiResp.Code)
+		}
+	})
+}
+
+func TestCreateRequiresDurableIntentBeforeService(t *testing.T) {
+	h := New(nil, &config.Config{})
+	r := setupOrderTestRouter(h, uuid.NewString())
+	for _, key := range []string{"", strings.Repeat("k", 129)} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/orders", strings.NewReader(`{"symbol":"TCS","side":"BUY","type":"MARKET","product":"DELIVERY","quantity":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		if key != "" {
+			req.Header.Set("Idempotency-Key", key)
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != 400 || !strings.Contains(w.Body.String(), "IDEMPOTENCY_KEY_REQUIRED") {
+			t.Fatalf("missing key gate: %d %s", w.Code, w.Body.String())
+		}
+	}
+}

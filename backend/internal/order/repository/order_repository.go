@@ -1,0 +1,442 @@
+package repository
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/accountchanges"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/database"
+	instrumentService "github.com/Dhiraj10002/Stock-Simulator/backend/internal/instrument/service"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/alias"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/model"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// Trading lookups deliberately read the authoritative database on every call.
+// A process-local cache cannot observe master activation or external retirement.
+type OrderRepository struct{}
+
+func New() *OrderRepository { return &OrderRepository{} }
+
+func (r *OrderRepository) Create(order *model.Order) error {
+	if database.GetDB() == nil {
+		return errors.New("database not connected")
+	}
+	return database.GetDB().Create(order).Error
+}
+
+// CreateDeliverySell verifies that the user holds enough free shares
+// (position quantity minus open/pending sell orders) and creates the order atomically.
+func (r *OrderRepository) CreateDeliverySell(order *model.Order) (resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			accountchanges.Notify(order.UserUUID.String())
+		}
+	}()
+	if database.GetDB() == nil {
+		return errors.New("database not connected")
+	}
+	return database.GetDB().Transaction(func(tx *gorm.DB) error { return createDeliverySell(tx, order) })
+}
+
+func createDeliverySell(tx *gorm.DB, order *model.Order) error {
+	// Lock wallet first to preserve uniform per-user serialization hierarchy
+	var wallet model.Wallet
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("user_uuid = ?", order.UserUUID).First(&wallet).Error; err != nil {
+		return err
+	}
+
+	var position model.Position
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_uuid = ? AND symbol = ? AND product = ?", order.UserUUID, order.Symbol, model.OrderProductDelivery).
+		First(&position).Error
+
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("cannot place DELIVERY sell order without holding shares of %s", order.Symbol)
+		}
+		return err
+	}
+	if position.Quantity <= 0 {
+		return fmt.Errorf("insufficient shares to sell: position quantity is %d", position.Quantity)
+	}
+
+	var committedShares int64
+	err = tx.Model(&model.Order{}).
+		Where("user_uuid = ? AND symbol = ? AND product = ? AND side = ? AND status IN ?",
+			order.UserUUID, order.Symbol, model.OrderProductDelivery, model.OrderSideSell,
+			[]string{model.OrderStatusPending, model.OrderStatusOpen, model.OrderStatusTriggerPending}).
+		Select("COALESCE(SUM(quantity), 0)").
+		Scan(&committedShares).Error
+	if err != nil {
+		return err
+	}
+
+	availableShares := position.Quantity - committedShares
+	if order.Quantity > availableShares {
+		return fmt.Errorf("insufficient available shares to sell: holding %d, %d committed to open orders, %d available",
+			position.Quantity, committedShares, availableShares)
+	}
+
+	return tx.Create(order).Error
+}
+
+func (r *OrderRepository) CreateWithReservation(order *model.Order, reservation int64) (resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			accountchanges.Notify(order.UserUUID.String())
+		}
+	}()
+	if database.GetDB() == nil {
+		return errors.New("database not connected")
+	}
+	return database.GetDB().Transaction(func(tx *gorm.DB) error { return createWithReservation(tx, order, reservation) })
+}
+
+func createWithReservation(tx *gorm.DB, order *model.Order, reservation int64) error {
+	var wallet model.Wallet
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("user_uuid = ?", order.UserUUID).First(&wallet).Error; err != nil {
+		return err
+	}
+	if wallet.AvailableBalancePaise() < reservation {
+		return gorm.ErrInvalidData
+	}
+	wallet.BlockedPaise += reservation
+	if err := tx.Save(&wallet).Error; err != nil {
+		return err
+	}
+
+	if err := tx.Create(&model.WalletTransaction{
+		WalletUUID:   wallet.UUID,
+		Type:         model.WalletTransactionReserve,
+		AmountPaise:  reservation,
+		BalancePaise: wallet.CashBalancePaise,
+		BlockedPaise: wallet.BlockedPaise,
+		Note:         "Order margin reserved",
+	}).Error; err != nil {
+		return err
+	}
+
+	order.ReservedPaise = reservation
+	return tx.Create(order).Error
+}
+
+func (r *OrderRepository) List(userUUID uuid.UUID) ([]model.Order, error) {
+
+	var orders []model.Order
+	err := database.GetDB().
+		Where("user_uuid = ? AND hidden_from_history = ?", userUUID, false).
+		Where("status NOT IN ? OR created_at >= ?", []string{model.OrderStatusExecuted, model.OrderStatusCancelled, model.OrderStatusRejected}, time.Now().Add(-24*time.Hour)).
+		Order("created_at DESC").
+		Find(&orders).Error
+	return orders, err
+}
+
+// Hide history without deleting financial records or durable retry keys.
+func (r *OrderRepository) ClearHistory(userUUID uuid.UUID) (int64, error) {
+	result := database.GetDB().Model(&model.Order{}).Where("user_uuid = ? AND hidden_from_history = ? AND status IN ?", userUUID, false, []string{model.OrderStatusExecuted, model.OrderStatusCancelled, model.OrderStatusRejected}).Update("hidden_from_history", true)
+	return result.RowsAffected, result.Error
+}
+
+func (r *OrderRepository) FindByUUID(userUUID, orderUUID uuid.UUID) (*model.Order, error) {
+	var order model.Order
+	err := database.GetDB().
+		Where("uuid = ? AND user_uuid = ?", orderUUID, userUUID).
+		First(&order).Error
+	return &order, err
+}
+
+func (r *OrderRepository) FindInstrument(symbol string) (*model.Instrument, error) {
+	if database.GetDB() == nil {
+		return nil, errors.New("database not connected")
+	}
+	clean := strings.ToUpper(strings.TrimSpace(symbol))
+	if clean == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	var instrument model.Instrument
+
+	// 1. Dynamic alias resolution: check canonical symbol first if mapped
+	canonical := alias.ResolveCanonicalSymbol(clean)
+	if canonical != "" && canonical != clean {
+		err := database.GetDB().Where("UPPER(symbol) IN ?", []string{canonical, canonical + "-EQ"}).
+			Order("is_tradable DESC, active DESC, id DESC").First(&instrument).Error
+		if err == nil {
+			return &instrument, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
+
+	// 2. Direct query with / without -EQ suffix, prioritizing tradable instruments
+	cleanAlt := clean + "-EQ"
+	if strings.HasSuffix(clean, "-EQ") {
+		cleanAlt = strings.TrimSuffix(clean, "-EQ")
+	}
+	err := database.GetDB().Where("UPPER(symbol) IN (?, ?)", clean, cleanAlt).
+		Order("is_tradable DESC, active DESC, id DESC").First(&instrument).Error
+	if err == nil {
+		return &instrument, nil
+	}
+
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+
+	// 3. Fallback to name or reverse alias match
+	aliases := alias.GetAliases(clean)
+	for _, a := range aliases {
+		err = database.GetDB().Where("UPPER(symbol) = ?", a).
+			Order("is_tradable DESC, active DESC, id DESC").First(&instrument).Error
+		if err == nil {
+			return &instrument, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
+
+	// 4. Broader match by name
+	cleanWithoutEQ := strings.TrimSuffix(clean, "-EQ")
+	err = database.GetDB().Where("UPPER(name) = ? AND instrument_type IN ('', 'EQ', 'EQUITY', 'INDEX', 'AMXIDX')", cleanWithoutEQ).
+		Order("is_tradable DESC, active DESC, id DESC").First(&instrument).Error
+	if err == nil {
+		return &instrument, nil
+	}
+
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	var count int64
+	if countErr := database.GetDB().Model(&model.Instrument{}).Count(&count).Error; countErr != nil {
+		return nil, countErr
+	}
+	if count > 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	// 5. Default canonical instruments fallback (for fresh setups / initial boot)
+	for _, inst := range instrumentService.DefaultCanonicalInstruments {
+		if inst.ExchangeSegment == "NFO" {
+			continue
+		}
+		if strings.EqualFold(inst.Symbol, clean) || strings.EqualFold(inst.Symbol, clean+"-EQ") || strings.EqualFold(inst.Name, clean) {
+			cp := inst
+			return &cp, nil
+		}
+		if canonical != "" && (strings.EqualFold(inst.Symbol, canonical) || strings.EqualFold(inst.Symbol, canonical+"-EQ") || strings.EqualFold(inst.Name, canonical)) {
+			cp := inst
+			return &cp, nil
+		}
+	}
+
+	return nil, err
+}
+
+// ListOpenLimitOrders returns candidates in FIFO order. Settlement still locks
+// and rechecks each order, so a cancellation racing with a quote is safe.
+func (r *OrderRepository) ListOpenLimitOrders(symbol string) ([]model.Order, error) {
+	var orders []model.Order
+	err := database.GetDB().
+		Where("symbol = ? AND type = ? AND status IN ?", symbol, model.OrderTypeLimit, []string{model.OrderStatusPending, model.OrderStatusOpen}).
+		Order("created_at ASC").
+		Find(&orders).Error
+	return orders, err
+}
+
+// ListActiveOrders returns all pending, open, or trigger-pending orders for a symbol.
+func (r *OrderRepository) ListActiveOrders(symbol string) ([]model.Order, error) {
+	var orders []model.Order
+	err := database.GetDB().
+		Where("symbol = ? AND status IN ?", symbol, []string{model.OrderStatusPending, model.OrderStatusOpen, model.OrderStatusTriggerPending}).
+		Order("created_at ASC").
+		Find(&orders).Error
+	return orders, err
+}
+
+func (r *OrderRepository) TriggerOrder(orderUUID uuid.UUID, newStatus string) error {
+	return database.GetDB().
+		Model(&model.Order{}).
+		Where("uuid = ? AND status = ?", orderUUID, model.OrderStatusTriggerPending).
+		Update("status", newStatus).Error
+}
+
+// Reject marks an order as rejected and releases any reserved funds atomically,
+// ensuring zero orphaned reservations even if a reserved order is rejected.
+func (r *OrderRepository) Reject(userUUID, orderUUID uuid.UUID) (resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			accountchanges.Notify(userUUID.String())
+		}
+	}()
+	return database.GetDB().Transaction(func(tx *gorm.DB) error {
+		var wallet model.Wallet
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_uuid = ?", userUUID).
+			First(&wallet).Error; err != nil {
+			return err
+		}
+
+		var order model.Order
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("uuid = ? AND user_uuid = ?", orderUUID, userUUID).
+			First(&order).Error; err != nil {
+			return err
+		}
+
+		if order.Status != model.OrderStatusPending &&
+			order.Status != model.OrderStatusOpen &&
+			order.Status != model.OrderStatusTriggerPending {
+			return gorm.ErrInvalidData
+		}
+
+		if order.ReservedPaise > 0 {
+			if wallet.BlockedPaise >= order.ReservedPaise {
+				wallet.BlockedPaise -= order.ReservedPaise
+				if err := tx.Save(&wallet).Error; err != nil {
+					return err
+				}
+
+				if err := tx.Create(&model.WalletTransaction{
+					WalletUUID:   wallet.UUID,
+					Type:         model.WalletTransactionRelease,
+					AmountPaise:  order.ReservedPaise,
+					BalancePaise: wallet.CashBalancePaise,
+					BlockedPaise: wallet.BlockedPaise,
+					Note:         "Rejected order funds released",
+				}).Error; err != nil {
+					return err
+				}
+			}
+			order.ReservedPaise = 0
+		}
+
+		order.Status = model.OrderStatusRejected
+		return tx.Save(&order).Error
+	})
+}
+
+func (r *OrderRepository) Cancel(userUUID, orderUUID uuid.UUID) (resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			accountchanges.Notify(userUUID.String())
+		}
+	}()
+	return database.GetDB().Transaction(func(tx *gorm.DB) error {
+		// Lock the wallet first, matching reservation, execution, and reset.
+		var wallet model.Wallet
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_uuid = ?", userUUID).
+			First(&wallet).Error; err != nil {
+			return err
+		}
+
+		var order model.Order
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("uuid = ? AND user_uuid = ?", orderUUID, userUUID).
+			First(&order).Error; err != nil {
+			return err
+		}
+
+		if order.Status != model.OrderStatusPending &&
+			order.Status != model.OrderStatusOpen &&
+			order.Status != model.OrderStatusTriggerPending {
+			return gorm.ErrInvalidData
+		}
+
+		if order.ReservedPaise > 0 {
+			if wallet.BlockedPaise < order.ReservedPaise {
+				return gorm.ErrInvalidData
+			}
+
+			wallet.BlockedPaise -= order.ReservedPaise
+
+			if err := tx.Save(&wallet).Error; err != nil {
+				return err
+			}
+
+			if err := tx.Create(&model.WalletTransaction{
+				WalletUUID:   wallet.UUID,
+				Type:         model.WalletTransactionRelease,
+				AmountPaise:  order.ReservedPaise,
+				BalancePaise: wallet.CashBalancePaise,
+				BlockedPaise: wallet.BlockedPaise,
+				Note:         "Cancelled order funds released",
+			}).Error; err != nil {
+				return err
+			}
+
+			order.ReservedPaise = 0
+		}
+
+		order.Status = model.OrderStatusCancelled
+
+		return tx.Save(&order).Error
+	})
+}
+
+var ErrIntentConflict = errors.New("idempotency key was already used for a different order")
+
+func (r *OrderRepository) FindIntent(user uuid.UUID, key, hash string) (*model.Order, error) {
+	if database.GetDB() == nil {
+		return nil, errors.New("database not connected")
+	}
+	var order model.Order
+	err := database.GetDB().Where("user_uuid = ? AND intent_key = ?", user, key).First(&order).Error
+	if err != nil {
+		return nil, err
+	}
+	if order.IntentHash != hash {
+		return nil, ErrIntentConflict
+	}
+	return &order, nil
+}
+
+// The transaction-scoped intent lock prevents concurrent retries from reserving
+// funds/shares twice. The unique index is the durable backstop across processes.
+func (r *OrderRepository) CreateIntent(order *model.Order, reservation int64) (resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			accountchanges.Notify(order.UserUUID.String())
+		}
+	}()
+	if database.GetDB() == nil {
+		return errors.New("database not connected")
+	}
+	return database.GetDB().Transaction(func(tx *gorm.DB) error {
+		if order.IntentKey != nil {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", order.UserUUID.String()+":"+*order.IntentKey).Error; err != nil {
+				return err
+			}
+			var prior model.Order
+			err := tx.Where("user_uuid = ? AND intent_key = ?", order.UserUUID, *order.IntentKey).First(&prior).Error
+			if err == nil {
+				if prior.IntentHash != order.IntentHash {
+					return ErrIntentConflict
+				}
+				*order = prior
+				return nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
+		if reservation > 0 {
+			return createWithReservation(tx, order, reservation)
+		}
+		if order.Product == model.OrderProductDelivery && order.Side == model.OrderSideSell {
+			return createDeliverySell(tx, order)
+		}
+		return tx.Create(order).Error
+	})
+}

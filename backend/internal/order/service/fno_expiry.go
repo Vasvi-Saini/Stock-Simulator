@@ -1,0 +1,402 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/accountchanges"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/database"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/calendar"
+	marketDTO "github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/dto"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/model"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/product"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+const (
+	riskEventFNOExpiry = "FNO_EXPIRY_SETTLEMENT"
+	settlementComplete = "COMPLETED"
+)
+
+// RunExpirySettlement is deliberately independent of MIS square-off. It
+// retries pending expired positions but never settles with a stale quote.
+func (s *OrderService) RunExpirySettlement(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		s.ProcessFNOExpiry(s.now())
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *OrderService) ProcessFNOExpiry(now time.Time) {
+	db := database.GetDB()
+	if db == nil {
+		return
+	}
+	var positions []model.Position
+	if err := db.Where("product = ? AND quantity <> 0 AND (settlement_state IS NULL OR settlement_state <> ?)", model.OrderProductFNO, settlementComplete).Find(&positions).Error; err != nil {
+		return
+	}
+	for _, position := range positions {
+		instrument, err := s.repo.FindInstrument(position.Symbol)
+		if err != nil || instrument == nil {
+			if synth, synthErr := product.ParseSyntheticFNOContract(position.Symbol); synthErr == nil && synth != nil {
+				instrument = synth
+			}
+		}
+		if instrument == nil {
+			s.recordExpiryRisk(position, fmt.Errorf("expired F&O instrument is missing from the canonical instrument master"))
+			continue
+		}
+		if !isExpired(instrument.Expiry, now) {
+			continue
+		}
+		kind, err := product.ValidateFNOInstrument(*instrument, abs(position.Quantity))
+		if err != nil {
+			s.recordExpiryRisk(position, err)
+			continue
+		}
+		settlementPrice, err := s.expiryPrice(*instrument, kind)
+		if err != nil {
+			s.recordExpiryRisk(position, err)
+			continue
+		}
+		if err := s.settleExpiredPosition(position.UUID, settlementPrice, kind); err != nil {
+			s.recordExpiryRisk(position, err)
+		}
+	}
+}
+
+func (s *OrderService) expiryPrice(instrument model.Instrument, kind string) (int64, error) {
+	if kind == product.InstrumentFuture {
+		return s.finalQuotePrice(instrument.Symbol, instrument.Expiry)
+	}
+	if strings.TrimSpace(instrument.UnderlyingSymbol) == "" {
+		return 0, fmt.Errorf("expired option has no explicit underlying symbol")
+	}
+	underlyingPrice, err := s.finalQuotePrice(instrument.UnderlyingSymbol, instrument.Expiry)
+	if err != nil {
+		return 0, err
+	}
+	strike, err := parsePaise(instrument.Strike)
+	if err != nil {
+		return 0, fmt.Errorf("invalid option strike: %w", err)
+	}
+	return optionIntrinsic(instrument.OptionType, underlyingPrice, strike)
+}
+
+// finalQuotePrice prefers a durable reference and never substitutes a quote
+// from another session or feed mode. Closing-window observations are explicitly
+// a paper-settlement proxy, not an official exchange settlement price.
+func (s *OrderService) finalQuotePrice(symbol, expiry string) (int64, error) {
+	day, err := expiryDate(expiry)
+	if err != nil {
+		return 0, err
+	}
+	mode := marketDTO.FeedModeLive
+	if s.market != nil {
+		mode = s.market.FeedMode()
+	}
+	if mode == marketDTO.FeedModeUnavailable {
+		return 0, fmt.Errorf("settlement feed unavailable")
+	}
+	db := database.GetDB()
+	if db == nil {
+		return 0, fmt.Errorf("settlement reference database unavailable")
+	}
+	segment := calendar.SegmentNSE
+	if inst, err := s.repo.FindInstrument(symbol); err == nil && inst != nil && strings.EqualFold(inst.ExchangeSegment, calendar.SegmentNFO) {
+		segment = calendar.SegmentNFO
+	}
+	var ref model.SettlementReference
+	err = db.Where("symbol = ? AND session_date = ? AND feed_mode = ?", symbol, day.Format("2006-01-02"), string(mode)).First(&ref).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, fmt.Errorf("read settlement reference: %w", err)
+	}
+	if err == nil {
+		if err := validateSettlementReference(ref, day, mode, segment); err == nil {
+			return ref.PricePaise, nil
+		}
+	}
+	quote, err := s.currentQuote(symbol)
+	if err != nil {
+		return 0, err
+	}
+	if quote == nil || quote.Symbol != symbol || quote.PricePaise <= 0 {
+		return 0, fmt.Errorf("valid settlement quote unavailable for %s", symbol)
+	}
+	observed, err := time.Parse(time.RFC3339Nano, quote.UpdatedAt)
+	if err != nil {
+		observed, err = time.Parse(time.RFC3339, quote.UpdatedAt)
+		if err != nil {
+			return 0, err
+		}
+	}
+	ref = model.SettlementReference{Symbol: symbol, SessionDate: day.Format("2006-01-02"), FeedMode: string(mode), Source: quote.Source, PricePaise: quote.PricePaise, ObservedAt: observed}
+	if err := validateSettlementReference(ref, day, mode, segment); err != nil {
+		return 0, err
+	}
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&ref).Error; err != nil {
+		return 0, fmt.Errorf("persist settlement reference: %w", err)
+	}
+	// A concurrent writer may have won. Use the durable row, never an
+	// unrecorded price that differs from the reference used after a restart.
+	if err := db.Where("symbol = ? AND session_date = ? AND feed_mode = ?", symbol, ref.SessionDate, string(mode)).First(&ref).Error; err != nil {
+		return 0, err
+	}
+	if err := validateSettlementReference(ref, day, mode, segment); err != nil {
+		return 0, err
+	}
+	return ref.PricePaise, nil
+}
+
+func validateSettlementReference(ref model.SettlementReference, day time.Time, mode marketDTO.FeedMode, segments ...string) error {
+	segment := calendar.SegmentNSE
+	if len(segments) > 0 {
+		segment = segments[0]
+	}
+	_, _, close := calendar.SegmentSessionBounds(day, segment)
+	if ref.PricePaise <= 0 || ref.FeedMode != string(mode) || ref.SessionDate != day.Format("2006-01-02") || !marketDTO.IsSourceExecutableInMode(marketDTO.NormalizeQuoteSource(ref.Source), mode) || ref.ObservedAt.Before(close.Add(-time.Minute)) || ref.ObservedAt.After(close) {
+		return fmt.Errorf("valid closing-window settlement reference unavailable")
+	}
+	return nil
+}
+
+func (s *OrderService) settleExpiredPosition(positionID uuid.UUID, settlementPrice int64, kind string, exitIDs ...uuid.UUID) (resultErr error) {
+	var owner string
+	defer func() {
+		if resultErr == nil && owner != "" {
+			accountchanges.Notify(owner)
+		}
+	}()
+	return database.GetDB().Transaction(func(tx *gorm.DB) error {
+		var preview model.Position
+		if err := tx.Where("uuid = ?", positionID).First(&preview).Error; err != nil {
+			return err
+		}
+		owner = preview.UserUUID.String()
+		// Enforce uniform locking hierarchy: Wallet -> Position
+		var wallet model.Wallet
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("user_uuid = ?", preview.UserUUID).First(&wallet).Error; err != nil {
+			return err
+		}
+		var position model.Position
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid = ?", positionID).First(&position).Error; err != nil {
+			return err
+		}
+		if position.Quantity == 0 || position.SettlementState == settlementComplete {
+			if len(exitIDs) > 0 {
+				return tx.Model(&model.Order{}).Where("uuid = ? AND user_uuid = ? AND status IN ?", exitIDs[0], position.UserUUID, []string{model.OrderStatusPending, model.OrderStatusOpen}).Update("status", model.OrderStatusCancelled).Error
+			}
+			return nil
+		}
+		if settlementPrice < 0 || (kind != product.InstrumentOption && (kind != product.InstrumentFuture || settlementPrice == 0)) {
+			return fmt.Errorf("invalid expiry settlement price or instrument kind")
+		}
+		var exit model.Order
+		if len(exitIDs) > 0 {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid = ? AND user_uuid = ?", exitIDs[0], position.UserUUID).First(&exit).Error; err != nil {
+				return err
+			}
+			if exit.Status != model.OrderStatusPending && exit.Status != model.OrderStatusOpen {
+				return fmt.Errorf("expiry exit cannot execute in %s status", exit.Status)
+			}
+			if staleExit(&exit, &position) || exit.Symbol != position.Symbol || exit.Product != position.Product || exit.ReservedPaise != 0 {
+				exit.Status = model.OrderStatusCancelled
+				return tx.Save(&exit).Error
+			}
+		}
+		quantity := abs(position.Quantity)
+		settlementValue, ok := multiply(quantity, settlementPrice)
+		if !ok {
+			return fmt.Errorf("settlement value is too large")
+		}
+		entryValue, ok := multiply(quantity, position.AveragePricePaise)
+		if !ok {
+			return fmt.Errorf("position value is too large")
+		}
+		pnl := settlementValue - entryValue
+		if position.Quantity < 0 {
+			pnl = entryValue - settlementValue
+		}
+		cashChange := pnl
+		if kind == product.InstrumentOption {
+			cashChange = settlementValue
+			if position.Quantity < 0 {
+				cashChange = -settlementValue
+			}
+		}
+		newCash, ok := add(wallet.CashBalancePaise, cashChange)
+		if !ok {
+			return fmt.Errorf("wallet balance is too large")
+		}
+		if wallet.BlockedPaise < position.MarginBlockedPaise {
+			return fmt.Errorf("position margin is missing")
+		}
+		wallet.CashBalancePaise, wallet.BlockedPaise = newCash, wallet.BlockedPaise-position.MarginBlockedPaise
+		if err := tx.Save(&wallet).Error; err != nil {
+			return err
+		}
+		if cashChange != 0 {
+			walletType := model.WalletTransactionCredit
+			walletAmount := cashChange
+			if cashChange < 0 {
+				walletType = model.WalletTransactionDebit
+				walletAmount = -cashChange
+			}
+			if err := tx.Create(&model.WalletTransaction{
+				WalletUUID:   wallet.UUID,
+				Type:         walletType,
+				AmountPaise:  walletAmount,
+				BalancePaise: wallet.CashBalancePaise,
+				BlockedPaise: wallet.BlockedPaise,
+				Note:         "F&O expiry settlement",
+			}).Error; err != nil {
+				return err
+			}
+		}
+		order := model.Order{UserUUID: position.UserUUID, Symbol: position.Symbol, Side: model.OrderSideSell, Type: model.OrderTypeMarket, Product: model.OrderProductFNO, Quantity: quantity, ExecutedPricePaise: settlementPrice, Status: model.OrderStatusExecuted, Source: model.OrderSourceSystem, Reason: model.OrderReasonFNOExpiry}
+		if position.Quantity < 0 {
+			order.Side = model.OrderSideBuy
+		}
+		if len(exitIDs) > 0 {
+			exit.Side, exit.Quantity, exit.ExecutedPricePaise = order.Side, quantity, settlementPrice
+			exit.Status, exit.Reason = model.OrderStatusExecuted, model.OrderReasonFNOExpiry
+			if err := tx.Save(&exit).Error; err != nil {
+				return err
+			}
+			order = exit
+		} else if err := tx.Create(&order).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&model.Trade{OrderUUID: order.UUID, UserUUID: position.UserUUID, Symbol: position.Symbol, Side: order.Side, Quantity: quantity, PricePaise: settlementPrice, TotalPaise: settlementValue, Product: model.OrderProductFNO, Source: model.OrderSourceSystem, Reason: model.OrderReasonFNOExpiry, RealizedPnlPaise: pnl, ExecutedAt: time.Now()}).Error; err != nil {
+			return err
+		}
+		position.Quantity, position.CostBasisPaise, position.MarginBlockedPaise = 0, 0, 0
+		position.CurrentPricePaise, position.AveragePricePaise = settlementPrice, 0
+		position.RealizedPnlPaise, ok = add(position.RealizedPnlPaise, pnl)
+		if !ok {
+			return fmt.Errorf("realized P&L is too large")
+		}
+		position.SettlementState = settlementComplete
+		if err := tx.Save(&position).Error; err != nil {
+			return err
+		}
+		// Other immutable exit intents must not outlive the position they close.
+		if err := tx.Model(&model.Order{}).Where("exit_position_uuid = ? AND uuid <> ? AND reserved_paise = 0 AND status IN ?", position.UUID, order.UUID, []string{model.OrderStatusPending, model.OrderStatusOpen}).Update("status", model.OrderStatusCancelled).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.RiskEvent{}).Where("user_uuid = ? AND symbol = ? AND product = ? AND event_type = ? AND status = ?",
+			position.UserUUID, position.Symbol, position.Product, riskEventFNOExpiry, riskStatusPending).Update("status", "RESOLVED").Error
+	})
+}
+
+func (s *OrderService) recordExpiryRisk(position model.Position, cause error) {
+	db := database.GetDB()
+	if db == nil {
+		return
+	}
+	_ = db.Model(&model.Position{}).Where("uuid = ?", position.UUID).Update("settlement_state", riskStatusPending).Error
+	var event model.RiskEvent
+	query := db.Where("user_uuid = ? AND symbol = ? AND product = ? AND event_type = ?", position.UserUUID, position.Symbol, position.Product, riskEventFNOExpiry).First(&event)
+	if query.Error == nil {
+		_ = db.Model(&event).Updates(map[string]any{"status": riskStatusPending, "message": cause.Error()}).Error
+		return
+	}
+	_ = db.Create(&model.RiskEvent{UserUUID: position.UserUUID, Symbol: position.Symbol, Product: position.Product, EventType: riskEventFNOExpiry, Status: riskStatusPending, Message: cause.Error()}).Error
+}
+
+func isExpired(value string, now time.Time) bool {
+	date, err := expiryDate(value)
+	if err != nil {
+		// Fail closed: contracts with missing or malformed expiry dates cannot be traded.
+		return true
+	}
+	_, _, cutoff := calendar.SegmentSessionBounds(date, calendar.SegmentNFO)
+	return !now.Before(cutoff)
+}
+
+func expiryDate(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, fmt.Errorf("empty expiry date")
+	}
+	for _, layout := range []string{
+		"2006-01-02",
+		"02Jan2006",
+		"02-Jan-2006",
+		"02Jan06",
+		"02-Jan-06",
+		"02/01/2006",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02 15:04:05",
+	} {
+		if date, err := time.ParseInLocation(layout, value, calendar.Location()); err == nil {
+			return date, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid expiry date: %s", value)
+}
+
+func parsePaise(value string) (int64, error) {
+	parts := strings.Split(strings.TrimSpace(value), ".")
+	if len(parts) > 2 || parts[0] == "" {
+		return 0, fmt.Errorf("invalid decimal")
+	}
+	whole, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || whole < 0 {
+		return 0, fmt.Errorf("invalid decimal")
+	}
+	fraction := ""
+	if len(parts) == 2 {
+		fraction = parts[1]
+	}
+	if len(fraction) > 2 && strings.TrimRight(fraction[2:], "0") != "" {
+		return 0, fmt.Errorf("fractional paise not supported")
+	}
+	for len(fraction) < 2 {
+		fraction += "0"
+	}
+	if len(fraction) > 2 {
+		fraction = fraction[:2]
+	}
+	minor := int64(0)
+	if fraction != "" {
+		minor, err = strconv.ParseInt(fraction, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid decimal")
+		}
+	}
+	if whole > (1<<63-1-minor)/100 {
+		return 0, fmt.Errorf("decimal too large")
+	}
+	return whole*100 + minor, nil
+}
+
+func optionIntrinsic(optionType string, underlyingPrice, strikePrice int64) (int64, error) {
+	switch strings.ToUpper(strings.TrimSpace(optionType)) {
+	case "CALL", "CE":
+		if underlyingPrice > strikePrice {
+			return underlyingPrice - strikePrice, nil
+		}
+		return 0, nil
+	case "PUT", "PE":
+		if strikePrice > underlyingPrice {
+			return strikePrice - underlyingPrice, nil
+		}
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("option type must be explicitly CALL or PUT")
+	}
+}

@@ -1,0 +1,437 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --background: #f8fafc;
+    --foreground: #0f172a;
+    --surface: #ffffff;
+    --surface-elevated: #f1f5f9;
+    --border: #e2e8f0;
+    --border-subtle: #f8fafc;
+    --primary: #0891b2;
+    --primary-foreground: #ffffff;
+    --gain: #10b981;
+    --loss: #f43f5e;
+    --warning: #f59e0b;
+    --muted: #64748b;
+    --muted-foreground: #94a3b8;
+  }
+
+  .dark {
+    --background: #06080e;
+    --foreground: #f8fafc;
+    --surface: #0b0f19;
+    --surface-elevated: #101626;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-subtle: rgba(255, 255, 255, 0.04);
+    --primary: #06b6d4;
+    --primary-foreground: #020617;
+    --gain: #10b981;
+    --loss: #f43f5e;
+    --warning: #f59e0b;
+    --muted: #64748b;
+    --muted-foreground: #94a3b8;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+/* Custom modern scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.6);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(51, 65, 85, 0.7);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.9);
+}
+
+/* Keyframe Animations */
+@keyframes slide-up {
+  from {
+    transform: translateY(16px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    transform: translateY(0);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes tick-up {
+  0% {
+    background-color: rgba(16, 185, 129, 0.4);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+@keyframes tick-down {
+  0% {
+    background-color: rgba(239, 68, 68, 0.4);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.2s ease-out forwards;
+}
+
+.animate-tick-up {
+  animation: tick-up 0.8s ease-out;
+}
+
+.animate-tick-down {
+  animation: tick-down 0.8s ease-out;
+}
+
+/* Tabular numbers for institutional financial precision */
+.font-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   MotionSites AI Design System: Ultra-Luxe Dark Mode
+   ========================================================================== */
+
+/* Allow layout.tsx fixed atmospheric ambient glow to show through full-screen page wrappers */
+/* Exclude [data-landing] so the cinematic landing page retains its dark background */
+.dark .min-h-screen:not([data-landing]),
+html:not(.dark) .min-h-screen:not([data-landing]) {
+  background-color: transparent !important;
+}
+
+/* ==========================================================================
+   MotionSites AI Design System: Ultra-Luxe Light Mode Glassmorphism
+   ========================================================================== */
+
+/* Universal Opaque Menus & Dropdown Surfaces (MUST NOT be translucent glass) */
+html:not(.dark) .solid-opaque-dropdown,
+.solid-opaque-dropdown {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  opacity: 1 !important;
+  box-shadow: 0 20px 40px -10px rgba(15, 23, 42, 0.25), 0 0 0 1px rgba(15, 23, 42, 0.08) !important;
+}
+
+.dark .solid-opaque-dropdown,
+html.dark .solid-opaque-dropdown {
+  background-color: #0b0f19 !important;
+  background: #0b0f19 !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  opacity: 1 !important;
+  box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.1) !important;
+}
+
+/* Universal Light Mode Glass Card Surface */
+html:not(.dark) .bg-white,
+html:not(.dark) .bg-white\/95,
+html:not(.dark) .bg-white\/90,
+html:not(.dark) .bg-white\/80,
+html:not(.dark) .bg-white\/70,
+html:not(.dark) .bg-white\/60 {
+  background-color: rgba(255, 255, 255, 0.78) !important;
+  backdrop-filter: blur(20px) !important;
+  -webkit-backdrop-filter: blur(20px) !important;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.95), 0 10px 30px -10px rgba(15, 23, 42, 0.08), 0 1px 3px 0 rgba(15, 23, 42, 0.04) !important;
+  border-color: rgba(226, 232, 240, 0.8) !important;
+}
+
+/* Nested Containers in Light Mode (Inputs, Filter rows, Sub-tables) */
+html:not(.dark) .bg-slate-50,
+html:not(.dark) .bg-slate-50\/90,
+html:not(.dark) .bg-slate-50\/80,
+html:not(.dark) .bg-slate-50\/70,
+html:not(.dark) .bg-slate-50\/60,
+html:not(.dark) .bg-slate-100,
+html:not(.dark) .bg-slate-100\/90,
+html:not(.dark) .bg-slate-100\/80,
+html:not(.dark) .bg-slate-100\/70 {
+  background-color: rgba(248, 250, 252, 0.65) !important;
+  backdrop-filter: blur(14px) !important;
+  -webkit-backdrop-filter: blur(14px) !important;
+}
+
+/* Delicate Frosted Borders in Light Mode */
+html:not(.dark) .border-slate-200,
+html:not(.dark) .border-slate-200\/90,
+html:not(.dark) .border-slate-200\/80,
+html:not(.dark) .border-slate-200\/70 {
+  border-color: rgba(226, 232, 240, 0.75) !important;
+}
+
+/* Light Mode Card Hover: Specular Lift + Ambient Cyan Halo */
+html:not(.dark) .hover\:border-cyan-500\/50:hover,
+html:not(.dark) .hover\:border-cyan-500\/40:hover,
+html:not(.dark) .hover\:border-cyan-500:hover,
+html:not(.dark) .hover\:shadow-md:hover {
+  border-color: rgba(6, 182, 212, 0.55) !important;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 1), 0 16px 36px -8px rgba(6, 182, 212, 0.2) !important;
+}
+
+/* Light Mode Table Row Hover */
+html:not(.dark) table tbody tr:hover {
+  background-color: rgba(241, 245, 249, 0.75) !important;
+}
+
+/* Light Mode Floating Navbar Glass (exclude landing page header) */
+html:not(.dark) header:not([data-landing]) {
+  background-color: rgba(255, 255, 255, 0.8) !important;
+  backdrop-filter: blur(20px) !important;
+  -webkit-backdrop-filter: blur(20px) !important;
+  box-shadow: inset 0 -1px 0 0 rgba(226, 232, 240, 0.8), 0 4px 20px -2px rgba(15, 23, 42, 0.04) !important;
+}
+
+/* Universal Glassmorphic Card Surface */
+.dark .bg-slate-900,
+.dark .bg-slate-900\/90,
+.dark .bg-slate-900\/80,
+.dark .bg-slate-900\/70,
+.dark .bg-slate-900\/60,
+.dark .bg-slate-900\/50,
+.dark .bg-slate-900\/40 {
+  background-color: rgba(11, 15, 26, 0.72) !important;
+  backdrop-filter: blur(20px) !important;
+  -webkit-backdrop-filter: blur(20px) !important;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.08), 0 12px 32px -8px rgba(0, 0, 0, 0.65) !important;
+}
+
+/* Deeper Nested Surfaces (Inputs, Sub-tables, Containers) */
+.dark .bg-slate-950,
+.dark .bg-slate-950\/90,
+.dark .bg-slate-950\/80,
+.dark .bg-slate-950\/70,
+.dark .bg-slate-950\/60,
+.dark .bg-slate-950\/50 {
+  background-color: rgba(6, 8, 15, 0.82) !important;
+  backdrop-filter: blur(12px) !important;
+  -webkit-backdrop-filter: blur(12px) !important;
+}
+
+/* Frosted Micro-Borders */
+.dark .border-slate-800,
+.dark .border-slate-800\/90,
+.dark .border-slate-800\/80,
+.dark .border-slate-800\/70,
+.dark .border-slate-800\/60,
+.dark .border-slate-800\/50 {
+  border-color: rgba(255, 255, 255, 0.075) !important;
+}
+
+.dark .border-slate-700,
+.dark .border-slate-700\/80,
+.dark .border-slate-700\/60 {
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+/* MotionSites Card Hover: Luminescence Border + Ambient Drop-Glow */
+.dark .hover\:border-cyan-500\/50:hover,
+.dark .hover\:border-cyan-500\/40:hover,
+.dark .hover\:border-cyan-500:hover,
+.dark .hover\:border-slate-700:hover {
+  border-color: rgba(6, 182, 212, 0.45) !important;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.16), 0 0 30px -4px rgba(6, 182, 212, 0.22) !important;
+}
+
+/* MotionSites AI Typography & Headings */
+.dark .motionsites-title {
+  background: linear-gradient(180deg, #FFFFFF 0%, #E2E8F0 65%, #94A3B8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* MotionSites AI Neon Pill Badge */
+.motionsites-badge-cyan {
+  background: rgba(6, 182, 212, 0.1);
+  border: 1px solid rgba(6, 182, 212, 0.28);
+  color: #38bdf8;
+  box-shadow: 0 0 12px -2px rgba(6, 182, 212, 0.25);
+}
+
+.motionsites-badge-emerald {
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.28);
+  color: #34d399;
+  box-shadow: 0 0 12px -2px rgba(16, 185, 129, 0.25);
+}
+
+.motionsites-badge-violet {
+  background: rgba(139, 92, 246, 0.1);
+  border: 1px solid rgba(139, 92, 246, 0.28);
+  color: #a78bfa;
+  box-shadow: 0 0 12px -2px rgba(139, 92, 246, 0.25);
+}
+
+/* MotionSites AI Interactive Action Button */
+.motionsites-btn-primary {
+  background: linear-gradient(135deg, #06b6d4 0%, #2563eb 50%, #4f46e5 100%);
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.25), 0 0 20px -3px rgba(6, 182, 212, 0.4);
+  color: #ffffff;
+  font-weight: 700;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.motionsites-btn-primary:hover {
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.35), 0 0 28px -2px rgba(6, 182, 212, 0.6);
+  transform: translateY(-1px);
+}
+
+/* Table Row Glass Hover */
+.dark table tbody tr:hover {
+  background-color: rgba(255, 255, 255, 0.035) !important;
+}
+
+/* Glassmorphic Panel utility */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.88);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+}
+
+.dark .glass-panel {
+  background: rgba(11, 15, 26, 0.72);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.08), 0 16px 36px -12px rgba(0, 0, 0, 0.6);
+}
+
+/* Micro glow effects for trading triggers */
+.glow-emerald {
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.35);
+}
+
+.glow-rose {
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.35);
+}
+
+.glow-cyan {
+  box-shadow: 0 0 12px rgba(6, 182, 212, 0.35);
+}
+
+/* Ticker tape infinite scroll animation */
+@keyframes ticker-scroll {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.animate-ticker-scroll {
+  animation: ticker-scroll 30s linear infinite;
+}
+
+/* Landing page hero float animation */
+@keyframes hero-float {
+  0%,
+  100% {
+    transform: translateY(0) perspective(800px) rotateX(1deg);
+  }
+  50% {
+    transform: translateY(-8px) perspective(800px) rotateX(0.5deg);
+  }
+}
+
+.animate-hero-float {
+  animation: hero-float 6s ease-in-out infinite;
+}
+
+/* RubberBand bouncy interactive letter hover animation (Portfolio style) */
+@keyframes rubberBand {
+  0% {
+    transform: scaleX(1);
+  }
+  30% {
+    transform: scale3d(1.25, 0.75, 1);
+  }
+  40% {
+    transform: scale3d(0.75, 1.25, 1);
+  }
+  50% {
+    transform: scale3d(1.15, 0.85, 1);
+  }
+  65% {
+    transform: scale3d(0.95, 1.05, 1);
+  }
+  75% {
+    transform: scale3d(1.05, 0.95, 1);
+  }
+  100% {
+    transform: scaleX(1);
+  }
+}
+
+.rubberBand {
+  display: inline-block !important;
+  animation: rubberBand 1s ease-in-out !important;
+  color: #ffffff !important;
+  -webkit-text-fill-color: #ffffff !important;
+}
+
+.hover-letter {
+  display: inline-block;
+  cursor: default;
+  transition: color 0.15s ease;
+}
+
+/* Keep the original landing effects without rendering React on pointer updates. */
+.landing-nav-link[aria-current="location"] {
+  color: white;
+  background: rgb(255 255 255 / 0.12);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.15), 0 1px 3px rgb(0 0 0 / 0.2);
+}
+.landing-nav-line { display: none; }
+.landing-nav-link[aria-current="location"] .landing-nav-line { display: block; }
+.landing-experience[data-motion-ready="true"] .landing-stars { visibility: hidden; }
+.landing-experience [data-in-view="false"] *,
+.landing-experience[data-page-hidden="true"] * { animation-play-state: paused !important; }
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .landing-letter:hover { animation: rubberBand 1s ease-in-out; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

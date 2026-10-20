@@ -1,0 +1,231 @@
+"use client";
+import { useAccountWallet } from "@/hooks/useAccountWallet";
+
+import { useState, Suspense } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import Navbar from "@/components/layout/Navbar";
+import {
+  BrainCircuit,
+  SlidersHorizontal,
+  ArrowRight,
+  ShieldAlert,
+  Bot,
+  Wallet as WalletIcon,
+  TrendingUp,
+  BarChart3,
+  Layers,
+  Activity,
+} from "lucide-react";
+import TradeCopilot from "@/components/mentor/TradeCopilot";
+import PreTradeRiskLab from "@/components/mentor/PreTradeRiskLab";
+import { formatPaise } from "@/lib/format";
+import { API_URL } from "@/lib/api";
+
+import { useRequireAuth } from "@/hooks/useRequireAuth";
+import { useAccountPortfolio } from "@/hooks/useAccountPortfolio";
+
+function MentorContent() {
+  const searchParams = useSearchParams();
+  const initialQuery = searchParams.get("query") || undefined;
+  const [activeTab, setActiveTab] = useState<"copilot" | "risklab">("copilot");
+  const token = useRequireAuth("/mentor");
+  const apiUrl = API_URL;
+
+  // Server state via TanStack Query with graceful fallback
+  const { data: wallet } = useAccountWallet();
+  const { data: portfolio } = useAccountPortfolio();
+
+  const availableBalance = wallet?.available_balance_paise;
+  const blockedMargin = wallet?.blocked_paise ?? 0;
+  const unrealizedPnl = portfolio?.unrealized_pnl_paise ?? 0;
+  const isPnlPositive = unrealizedPnl >= 0;
+  const openPositionsCount = portfolio?.positions?.length ?? 0;
+
+  if (!token) {
+    return (
+      <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+        <Navbar />
+        <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
+          <div className="p-16 text-center text-slate-500">
+            <div className="w-8 h-8 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+            <p className="text-xs">Redirecting to login…</p>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+      <Navbar
+        availableBalancePaise={availableBalance}
+        unrealizedPnlPaise={unrealizedPnl}
+      />
+
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
+        {/* Header Bar */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-5 border-b border-slate-200/90 dark:border-slate-800">
+          <div>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <div className="p-2.5 rounded-2xl bg-gradient-to-br from-cyan-500/15 to-blue-500/25 dark:from-cyan-950 dark:to-blue-950/50 border border-cyan-500/30 text-cyan-600 dark:text-cyan-400 shadow-sm shadow-cyan-500/10">
+                <BrainCircuit className="w-6 h-6" />
+              </div>
+              <h1 className="text-2xl sm:text-3xl font-black text-slate-900 dark:text-slate-100 tracking-tight">
+                AI Behavioral Copilot & Risk Mentor
+              </h1>
+            </div>
+            <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-2 max-w-2xl leading-relaxed">
+              Real-time trading discipline letter grades (A+ to F), emotional revenge-trading detection, risk-reward symmetry auditing, and pre-trade simulation.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <Link
+              href="/analytics"
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-800 text-xs font-semibold shadow-sm transition-all hover:scale-[1.02]"
+            >
+              <BarChart3 className="w-4 h-4 text-cyan-600 dark:text-cyan-400" />
+              <span>Performance</span>
+            </Link>
+            <Link
+              href="/stocks/ITC"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 active:bg-cyan-700 text-white font-bold text-xs shadow-md shadow-cyan-600/20 transition-all hover:scale-105 active:scale-95"
+            >
+              <SlidersHorizontal className="w-4 h-4 text-white" />
+              <span>Explore Market</span>
+              <ArrowRight className="w-3.5 h-3.5 text-white" />
+            </Link>
+          </div>
+        </div>
+
+        {/* Live Context Metrics Ribbon */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
+          {/* Card 1: Available Margin */}
+          <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm hover:border-emerald-400/50 dark:hover:border-emerald-500/40 transition-all">
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="text-xs text-slate-500 dark:text-slate-400 font-semibold">Available Margin</span>
+              <div className="p-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400">
+                <WalletIcon className="w-3.5 h-3.5" />
+              </div>
+            </div>
+            <p className="text-lg font-bold font-mono text-slate-900 dark:text-slate-100">
+              {formatPaise(availableBalance)}
+            </p>
+            <span className="text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">
+              100% Risk-Free Starting Capital
+            </span>
+          </div>
+
+          {/* Card 2: Blocked Margin */}
+          <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm hover:border-amber-400/50 dark:hover:border-amber-500/40 transition-all">
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="text-xs text-slate-500 dark:text-slate-400 font-semibold">Blocked Margin</span>
+              <div className="p-1.5 rounded-lg bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800 text-amber-600 dark:text-amber-400">
+                <Layers className="w-3.5 h-3.5" />
+              </div>
+            </div>
+            <p className="text-lg font-bold font-mono text-slate-900 dark:text-slate-100">
+              {formatPaise(blockedMargin)}
+            </p>
+            <span className="text-[11px] text-slate-400">
+              Active Order Reserve
+            </span>
+          </div>
+
+          {/* Card 3: Open Positions */}
+          <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm hover:border-cyan-400/50 dark:hover:border-cyan-500/40 transition-all">
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="text-xs text-slate-500 dark:text-slate-400 font-semibold">Open Positions</span>
+              <div className="p-1.5 rounded-lg bg-cyan-50 dark:bg-cyan-950/60 border border-cyan-200 dark:border-cyan-800 text-cyan-600 dark:text-cyan-400">
+                <TrendingUp className="w-3.5 h-3.5" />
+              </div>
+            </div>
+            <p className="text-lg font-bold font-mono text-slate-900 dark:text-slate-100">
+              {openPositionsCount} {openPositionsCount === 1 ? "Position" : "Positions"}
+            </p>
+            <span className="text-[11px] text-slate-400">
+              Live Holdings & Derivatives
+            </span>
+          </div>
+
+          {/* Card 4: Live Unrealized P&L */}
+          <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm hover:border-indigo-400/50 dark:hover:border-indigo-500/40 transition-all">
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="text-xs text-slate-500 dark:text-slate-400 font-semibold">Live Unrealized P&L</span>
+              <div className={`p-1.5 rounded-lg border ${
+                isPnlPositive
+                  ? "bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400"
+                  : "bg-rose-50 dark:bg-rose-950/60 border-rose-200 dark:border-rose-800 text-rose-600 dark:text-rose-400"
+              }`}>
+                <Activity className="w-3.5 h-3.5" />
+              </div>
+            </div>
+            <p className={`text-lg font-bold font-mono ${isPnlPositive ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+              {isPnlPositive ? "+" : ""}{formatPaise(unrealizedPnl)}
+            </p>
+            <span className="text-[11px] text-slate-400">
+              Real-time Portfolio MTM
+            </span>
+          </div>
+        </div>
+
+        {/* Segmented Tab Switcher */}
+        <div className="flex items-center bg-slate-200/70 dark:bg-slate-950 p-1.5 rounded-2xl border border-slate-300/80 dark:border-slate-800 shadow-inner w-fit">
+          <button
+            type="button"
+            onClick={() => setActiveTab("copilot")}
+            className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold transition-all ${
+              activeTab === "copilot"
+                ? "bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-md shadow-slate-300/40 dark:shadow-black/40 scale-100"
+                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+            }`}
+          >
+            <Bot className={`w-4 h-4 ${activeTab === "copilot" ? "text-cyan-500" : ""}`} />
+            <span>Behavioral Copilot & Audit</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("risklab")}
+            className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold transition-all ${
+              activeTab === "risklab"
+                ? "bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-md shadow-slate-300/40 dark:shadow-black/40 scale-100"
+                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+            }`}
+          >
+            <ShieldAlert className={`w-4 h-4 ${activeTab === "risklab" ? "text-indigo-500" : ""}`} />
+            <span>Pre-Trade Risk Lab</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-500/30 font-bold">
+              Simulation
+            </span>
+          </button>
+        </div>
+
+        {/* Tab Content Panel */}
+        <div className="bg-white dark:bg-slate-900/80 border border-slate-200/90 dark:border-slate-800 rounded-3xl shadow-xl shadow-slate-200/50 dark:shadow-slate-950/60 p-4 sm:p-6 transition-all">
+          {activeTab === "copilot" && (
+            <TradeCopilot token={token} apiUrl={apiUrl} initialQuery={initialQuery} />
+          )}
+
+          {activeTab === "risklab" && (
+            <PreTradeRiskLab token={token} apiUrl={apiUrl} />
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+export default function MentorPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center text-slate-400 text-xs font-mono">
+          Loading Trade-Aware AI Mentor…
+        </div>
+      }
+    >
+      <MentorContent />
+    </Suspense>
+  );
+}

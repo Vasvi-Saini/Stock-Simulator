@@ -1,0 +1,320 @@
+package handler
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/service"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/pkg/response"
+	"github.com/gin-gonic/gin"
+)
+
+func init() {
+	gin.SetMode(gin.TestMode)
+}
+
+func getTestRedis(t *testing.T) *service.Service {
+	t.Helper()
+	urls := []string{
+		os.Getenv("TEST_REDIS_URL"),
+		os.Getenv("REDIS_URL"),
+		"redis://localhost:6380/0",
+		"redis://localhost:6379/0",
+	}
+	for _, u := range urls {
+		if u == "" {
+			continue
+		}
+		svc, err := service.New(u, 200*time.Millisecond)
+		if err == nil && svc.Client() != nil && svc.Client().Ping(t.Context()).Err() == nil {
+			return svc
+		}
+	}
+	t.Skip("skipping test: Redis not reachable on configured URLs (checked 6380 and 6379)")
+	return nil
+}
+
+func setupTestRouter(svc *service.Service) *gin.Engine {
+	h := &Handler{service: svc}
+	r := gin.New()
+	r.GET("/api/v1/market/quote/:symbol", h.Quote)
+	r.GET("/api/v1/market/history/:symbol", h.History)
+	r.GET("/api/v1/market/movers", h.Movers)
+	r.GET("/api/v1/market/breadth", h.Breadth)
+	r.GET("/api/v1/market/indices", h.Indices)
+	r.GET("/api/v1/market/sectors", h.Sectors)
+	r.GET("/api/v1/market/status", h.Status)
+	return r
+}
+
+func TestMarketHandler_ErrorSemantics(t *testing.T) {
+	t.Run("Returns 404 INSTRUMENT_NOT_FOUND for unknown instruments", func(t *testing.T) {
+		svc := &service.Service{}
+		svc.SetInstrumentFinder(func(symbol string) (bool, error) {
+			return false, nil
+		})
+		r := setupTestRouter(svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/quote/UNKNOWN_XYZ", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &apiResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if apiResp.Success {
+			t.Fatal("expected success=false")
+		}
+		if apiResp.Errors != "INSTRUMENT_NOT_FOUND" {
+			t.Fatalf("expected error code INSTRUMENT_NOT_FOUND, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("Returns 404 QUOTE_NOT_FOUND when quote is missing from cache and worker", func(t *testing.T) {
+		// Mock worker returning 404
+		workerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		}))
+		defer workerServer.Close()
+
+		svc := getTestRedis(t)
+		svc.SetWorkerURL(workerServer.URL)
+		svc.SetInstrumentFinder(func(symbol string) (bool, error) {
+			return true, nil // Known instrument, but quote missing
+		})
+
+		r := setupTestRouter(svc)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/quote/NON_EXISTENT_QUOTE_KEY_12345", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &apiResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if apiResp.Errors != "QUOTE_NOT_FOUND" {
+			t.Fatalf("expected error code QUOTE_NOT_FOUND, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("Returns 422 QUOTE_STALE when quote is older than 2 minutes", func(t *testing.T) {
+		svc := getTestRedis(t)
+		staleSym := "STALE_HANDLER_SYM"
+		staleTime := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+		_ = svc.Client().HSet(t.Context(), "market:quote:"+staleSym, map[string]interface{}{
+			"price_paise": "123400",
+			"source":      "angelone_live",
+			"updated_at":  staleTime,
+		}).Err()
+		defer svc.Client().Del(t.Context(), "market:quote:"+staleSym)
+
+		r := setupTestRouter(svc)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/quote/"+staleSym, nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("expected status 422, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &apiResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if apiResp.Errors != "QUOTE_STALE" {
+			t.Fatalf("expected error code QUOTE_STALE, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("Returns 503 MARKET_DATA_UNAVAILABLE when market service is disconnected", func(t *testing.T) {
+		svc := &service.Service{} // nil client
+		r := setupTestRouter(svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/quote/RELIANCE", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected status 503, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &apiResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if apiResp.Errors != "MARKET_DATA_UNAVAILABLE" {
+			t.Fatalf("expected error code MARKET_DATA_UNAVAILABLE, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("History returns 404 INSTRUMENT_NOT_FOUND for unknown instruments", func(t *testing.T) {
+		svc := &service.Service{}
+		svc.SetInstrumentFinder(func(symbol string) (bool, error) {
+			return false, nil
+		})
+		r := setupTestRouter(svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/history/UNKNOWN_XYZ", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &apiResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if apiResp.Errors != "INSTRUMENT_NOT_FOUND" {
+			t.Fatalf("expected error code INSTRUMENT_NOT_FOUND, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("History returns 503 MARKET_DATA_UNAVAILABLE when market service is disconnected", func(t *testing.T) {
+		svc := &service.Service{}
+		r := setupTestRouter(svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/history/RELIANCE", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected status 503, got %d. Body: %s", w.Code, w.Body.String())
+		}
+
+		var apiResp response.APIResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &apiResp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if apiResp.Errors != "MARKET_DATA_UNAVAILABLE" {
+			t.Fatalf("expected error code MARKET_DATA_UNAVAILABLE, got %v", apiResp.Errors)
+		}
+	})
+
+	t.Run("Movers returns 503 MARKET_DATA_UNAVAILABLE when market service is disconnected", func(t *testing.T) {
+		svc := &service.Service{}
+		r := setupTestRouter(svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/movers", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected status 503, got %d. Body: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("Breadth returns 503 MARKET_DATA_UNAVAILABLE when market service is disconnected", func(t *testing.T) {
+		svc := &service.Service{}
+		r := setupTestRouter(svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/breadth", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected status 503, got %d. Body: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("Indices returns 503 MARKET_DATA_UNAVAILABLE when market service is disconnected", func(t *testing.T) {
+		svc := &service.Service{}
+		r := setupTestRouter(svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/indices", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected status 503, got %d. Body: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("Sectors returns 503 MARKET_DATA_UNAVAILABLE when market service is disconnected", func(t *testing.T) {
+		svc := &service.Service{}
+		r := setupTestRouter(svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/api/v1/market/sectors", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected status 503, got %d. Body: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("Indices and Sectors return 200 OK when service is active", func(t *testing.T) {
+		svc := getTestRedis(t)
+		r := setupTestRouter(svc)
+
+		// Test Indices
+		wIdx := httptest.NewRecorder()
+		reqIdx, _ := http.NewRequest("GET", "/api/v1/market/indices", nil)
+		r.ServeHTTP(wIdx, reqIdx)
+		if wIdx.Code != http.StatusOK {
+			t.Fatalf("expected status 200 for indices, got %d", wIdx.Code)
+		}
+
+		// Test Sectors
+		wSec := httptest.NewRecorder()
+		reqSec, _ := http.NewRequest("GET", "/api/v1/market/sectors", nil)
+		r.ServeHTTP(wSec, reqSec)
+		if wSec.Code != http.StatusOK {
+			t.Fatalf("expected status 200 for sectors, got %d", wSec.Code)
+		}
+	})
+
+	t.Run("Status returns segment metadata and bounds", func(t *testing.T) {
+		svc := &service.Service{}
+		r := setupTestRouter(svc)
+
+		// Test default segment (NSE)
+		wDefault := httptest.NewRecorder()
+		reqDefault, _ := http.NewRequest("GET", "/api/v1/market/status", nil)
+		r.ServeHTTP(wDefault, reqDefault)
+		if wDefault.Code != http.StatusOK {
+			t.Fatalf("expected status 200 for default status, got %d", wDefault.Code)
+		}
+		var respDefault map[string]interface{}
+		if err := json.Unmarshal(wDefault.Body.Bytes(), &respDefault); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		dataDefault := respDefault["data"].(map[string]interface{})
+		if dataDefault["segment"] != "NSE" {
+			t.Fatalf("expected segment NSE, got %v", dataDefault["segment"])
+		}
+		if dataDefault["market_open"] == nil || dataDefault["market_close"] == nil {
+			t.Fatalf("expected market_open and market_close in response")
+		}
+
+		// Test NFO segment
+		wNFO := httptest.NewRecorder()
+		reqNFO, _ := http.NewRequest("GET", "/api/v1/market/status?segment=NFO", nil)
+		r.ServeHTTP(wNFO, reqNFO)
+		if wNFO.Code != http.StatusOK {
+			t.Fatalf("expected status 200 for NFO status, got %d", wNFO.Code)
+		}
+		var respNFO map[string]interface{}
+		if err := json.Unmarshal(wNFO.Body.Bytes(), &respNFO); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		dataNFO := respNFO["data"].(map[string]interface{})
+		if dataNFO["segment"] != "NFO" {
+			t.Fatalf("expected segment NFO, got %v", dataNFO["segment"])
+		}
+	})
+}

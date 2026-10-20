@@ -1,0 +1,815 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/config"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/database"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/alias"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/calendar"
+	marketDTO "github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/dto"
+	marketService "github.com/Dhiraj10002/Stock-Simulator/backend/internal/market/service"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/model"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/order/dto"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/order/repository"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/internal/product"
+	"github.com/Dhiraj10002/Stock-Simulator/backend/pkg/logger"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+)
+
+var (
+	// ErrInstrumentNotFound indicates the symbol does not exist in the canonical instrument master.
+	ErrInstrumentNotFound = errors.New("instrument not found in canonical instrument master")
+)
+
+type OrderService struct {
+	repo                *repository.OrderRepository
+	market              *marketService.Service
+	rules               product.Rules
+	nowFunc             func() time.Time
+	executableQuoteFunc func(symbol string) (*marketDTO.QuoteResponse, error)
+	currentQuoteFunc    func(symbol string) (*marketDTO.QuoteResponse, error)
+	instrumentFinder    func(symbol string) (*model.Instrument, error)
+	createOrderFunc     func(order *model.Order) error
+	activeSymbolsMu     sync.RWMutex
+	activeSymbols       map[string]int
+	activeOrders        map[string][]model.Order
+}
+
+func New(market *marketService.Service, cfg *config.Config) *OrderService {
+	svc := &OrderService{
+		repo:          repository.New(),
+		market:        market,
+		rules:         product.FromConfig(cfg),
+		activeSymbols: make(map[string]int),
+		activeOrders:  make(map[string][]model.Order),
+	}
+	_ = svc.RebuildActiveSymbolsFromDB()
+	return svc
+}
+
+func (s *OrderService) SetNowFunc(fn func() time.Time) {
+	s.nowFunc = fn
+}
+
+func (s *OrderService) SetExecutableQuoteFunc(fn func(symbol string) (*marketDTO.QuoteResponse, error)) {
+	s.executableQuoteFunc = fn
+}
+
+func (s *OrderService) SetCurrentQuoteFunc(fn func(symbol string) (*marketDTO.QuoteResponse, error)) {
+	s.currentQuoteFunc = fn
+}
+
+func (s *OrderService) SetInstrumentFinder(fn func(symbol string) (*model.Instrument, error)) {
+	s.instrumentFinder = fn
+}
+
+func (s *OrderService) SetCreateOrderFunc(fn func(order *model.Order) error) {
+	s.createOrderFunc = fn
+}
+
+func (s *OrderService) executableQuote(symbol string) (*marketDTO.QuoteResponse, error) {
+	if s.executableQuoteFunc != nil {
+		return s.executableQuoteFunc(symbol)
+	}
+	if s.market != nil {
+		return s.market.ExecutableQuote(symbol)
+	}
+	return nil, fmt.Errorf("market service not configured")
+}
+
+func (s *OrderService) currentQuote(symbol string) (*marketDTO.QuoteResponse, error) {
+	if s.currentQuoteFunc != nil {
+		return s.currentQuoteFunc(symbol)
+	}
+	if s.executableQuoteFunc != nil {
+		return s.executableQuoteFunc(symbol)
+	}
+	if s.market != nil {
+		return s.market.CurrentQuote(symbol)
+	}
+	return nil, fmt.Errorf("market service not configured")
+}
+
+func (s *OrderService) now() time.Time {
+	if s.nowFunc != nil {
+		return s.nowFunc()
+	}
+	return time.Now()
+}
+
+func (s *OrderService) Create(userID string, request dto.CreateOrderRequest, retryKeys ...string) (*dto.OrderResponse, error) {
+	createStart := time.Now()
+	var redisDuration time.Duration
+
+	userUUID, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user identity")
+	}
+	request.Symbol = strings.ToUpper(strings.TrimSpace(request.Symbol))
+	if request.Symbol == "" {
+		return nil, fmt.Errorf("symbol is required")
+	}
+	request.Side = strings.ToUpper(strings.TrimSpace(request.Side))
+	if request.Side != model.OrderSideBuy && request.Side != model.OrderSideSell {
+		return nil, fmt.Errorf("invalid order side %q; must be BUY or SELL", request.Side)
+	}
+	request.Type = strings.ToUpper(strings.TrimSpace(request.Type))
+	if request.Type != model.OrderTypeMarket && request.Type != model.OrderTypeLimit &&
+		request.Type != model.OrderTypeSL && request.Type != model.OrderTypeSLM {
+		return nil, fmt.Errorf("invalid order type %q; must be MARKET, LIMIT, SL, or SL-M", request.Type)
+	}
+
+	// Normalize product aliases (e.g. CNC -> DELIVERY, MIS -> INTRADAY, F&O -> FNO)
+	switch strings.ToUpper(strings.TrimSpace(request.Product)) {
+	case "CNC", model.OrderProductDelivery:
+		request.Product = model.OrderProductDelivery
+	case "MIS", model.OrderProductIntraday:
+		request.Product = model.OrderProductIntraday
+	case model.OrderProductFNO, "F&O":
+		request.Product = model.OrderProductFNO
+	}
+
+	if !isSupportedProduct(request.Product) {
+		return nil, fmt.Errorf("unsupported order product %s", request.Product)
+	}
+	if request.Quantity <= 0 {
+		return nil, fmt.Errorf("order quantity must be greater than zero")
+	}
+	if (request.Type == model.OrderTypeLimit || request.Type == model.OrderTypeSL) && request.PricePaise <= 0 {
+		return nil, fmt.Errorf("limit and stop-loss limit orders require a positive price")
+	}
+	if request.Type == model.OrderTypeMarket && request.PricePaise != 0 {
+		return nil, fmt.Errorf("market orders must not include a price")
+	}
+	if request.Type == model.OrderTypeSLM && request.PricePaise != 0 {
+		return nil, fmt.Errorf("SL-M orders must not include a price")
+	}
+	if (request.Type == model.OrderTypeSL || request.Type == model.OrderTypeSLM) && request.TriggerPricePaise <= 0 {
+		return nil, fmt.Errorf("stop-loss orders require a positive trigger price")
+	}
+
+	var intentKey *string
+	var intentHash string
+	if len(retryKeys) > 0 {
+		key := strings.TrimSpace(retryKeys[0])
+		if key == "" || len(key) > 128 {
+			return nil, fmt.Errorf("Idempotency-Key must contain 1-128 characters")
+		}
+		encoded, _ := json.Marshal(request)
+		intentHash = fmt.Sprintf("%x", sha256.Sum256(encoded))
+		intentKey = &key
+		if s.createOrderFunc == nil {
+			prior, err := s.repo.FindIntent(userUUID, key, intentHash)
+			if err == nil {
+				return s.finishCreated(userID, prior)
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, err
+			}
+		}
+	}
+
+	// Market Session Check: New orders are rejected outside trading hours.
+	// Equity derivatives (NFO) close at 15:40 IST; cash equities close at 15:30 IST.
+	// Existing open LIMIT orders remain open across sessions and are not rejected here.
+	now := s.now()
+	segment := calendar.SegmentNSE
+	if request.Product == model.OrderProductFNO {
+		segment = calendar.SegmentNFO
+	}
+	if err := calendar.ValidateNewOrderSessionForSegment(now, segment); err != nil {
+		return nil, err
+	}
+
+	var instrument *model.Instrument
+	isLiveMode := s.market == nil || s.market.FeedMode() == marketDTO.FeedModeLive
+	if s.instrumentFinder != nil {
+		found, err := s.instrumentFinder(request.Symbol)
+		if err == nil && found != nil {
+			instrument = found
+		} else {
+			if isLiveMode {
+				return nil, fmt.Errorf("%w: instrument %q not found in canonical instrument master (real F&O under LIVE mode permits only canonical DB instruments)", ErrInstrumentNotFound, request.Symbol)
+			}
+			synth, synthErr := product.ParseSyntheticFNOContract(request.Symbol)
+			if synthErr == nil && synth != nil {
+				instrument = synth
+			} else {
+				return nil, fmt.Errorf("%w: instrument %q not found in canonical instrument master", ErrInstrumentNotFound, request.Symbol)
+			}
+		}
+	} else if database.GetDB() != nil {
+		found, err := s.repo.FindInstrument(request.Symbol)
+		if err == nil && found != nil {
+			instrument = found
+		} else {
+			if isLiveMode {
+				return nil, fmt.Errorf("%w: instrument %q not found in canonical instrument master (real F&O under LIVE mode permits only canonical DB instruments)", ErrInstrumentNotFound, request.Symbol)
+			}
+			synth, synthErr := product.ParseSyntheticFNOContract(request.Symbol)
+			if synthErr == nil && synth != nil {
+				instrument = synth
+			} else {
+				return nil, fmt.Errorf("%w: instrument %q not found in canonical instrument master", ErrInstrumentNotFound, request.Symbol)
+			}
+		}
+	} else if request.Product == model.OrderProductFNO {
+		if isLiveMode {
+			return nil, fmt.Errorf("F&O instrument verification requires database connection")
+		}
+		synth, synthErr := product.ParseSyntheticFNOContract(request.Symbol)
+		if synthErr == nil && synth != nil {
+			instrument = synth
+		} else {
+			return nil, fmt.Errorf("F&O instrument verification requires database connection")
+		}
+	}
+
+	if instrument != nil {
+		if err := product.ValidateNewInstrument(*instrument, request.Product); err != nil {
+			return nil, err
+		}
+	}
+
+	// Stop-Loss Directional Validation against current quote
+	if request.Type == model.OrderTypeSL || request.Type == model.OrderTypeSLM {
+		curQuote, qErr := s.currentQuote(request.Symbol)
+		if qErr == nil && curQuote != nil && curQuote.PricePaise > 0 {
+			if request.Side == model.OrderSideBuy && request.TriggerPricePaise < curQuote.PricePaise {
+				return nil, fmt.Errorf("BUY stop-loss trigger price (%d) must be >= current market price (%d)", request.TriggerPricePaise, curQuote.PricePaise)
+			}
+			if request.Side == model.OrderSideSell && request.TriggerPricePaise > curQuote.PricePaise {
+				return nil, fmt.Errorf("SELL stop-loss trigger price (%d) must be <= current market price (%d)", request.TriggerPricePaise, curQuote.PricePaise)
+			}
+		}
+	}
+
+	// Circuit Breaker Validation against Daily Price Bands (Real Exchange Limits or fallback bands)
+	curQuote, qErr := s.currentQuote(request.Symbol)
+	if qErr == nil && curQuote != nil && curQuote.LowerCircuitPaise > 0 && curQuote.UpperCircuitPaise > 0 {
+		lc, uc := resolveCircuitLimits(curQuote, request.Product)
+		if (request.Type == model.OrderTypeLimit || request.Type == model.OrderTypeSL) && request.PricePaise > 0 {
+			if request.PricePaise > uc {
+				return nil, fmt.Errorf("limit price ₹%.2f exceeds daily upper circuit limit of ₹%.2f", float64(request.PricePaise)/100, float64(uc)/100)
+			}
+			if request.PricePaise < lc {
+				return nil, fmt.Errorf("limit price ₹%.2f falls below daily lower circuit limit of ₹%.2f", float64(request.PricePaise)/100, float64(lc)/100)
+			}
+		}
+		if (request.Type == model.OrderTypeSL || request.Type == model.OrderTypeSLM) && request.TriggerPricePaise > 0 {
+			if request.TriggerPricePaise > uc {
+				return nil, fmt.Errorf("trigger price ₹%.2f exceeds daily upper circuit limit of ₹%.2f", float64(request.TriggerPricePaise)/100, float64(uc)/100)
+			}
+			if request.TriggerPricePaise < lc {
+				return nil, fmt.Errorf("trigger price ₹%.2f falls below daily lower circuit limit of ₹%.2f", float64(request.TriggerPricePaise)/100, float64(lc)/100)
+			}
+		}
+	}
+
+	// Tick Size Validation for non-market orders
+	tickSizeStr := "0.05"
+	if instrument != nil && instrument.TickSize != "" {
+		tickSizeStr = instrument.TickSize
+	}
+	if (request.Type == model.OrderTypeLimit || request.Type == model.OrderTypeSL) && request.PricePaise > 0 {
+		if err := product.ValidateTickSize(request.PricePaise, tickSizeStr); err != nil {
+			return nil, fmt.Errorf("order price invalid: %w", err)
+		}
+	}
+	if (request.Type == model.OrderTypeSL || request.Type == model.OrderTypeSLM) && request.TriggerPricePaise > 0 {
+		if err := product.ValidateTickSize(request.TriggerPricePaise, tickSizeStr); err != nil {
+			return nil, fmt.Errorf("trigger price invalid: %w", err)
+		}
+	}
+
+	if request.Product == model.OrderProductIntraday {
+		if err := product.ValidateMISOrder(now); err != nil {
+			return nil, err
+		}
+	}
+	if request.Product == model.OrderProductFNO {
+		if instrument != nil {
+			if _, err := product.ValidateFNOInstrument(*instrument, request.Quantity); err != nil {
+				return nil, err
+			}
+			if isExpired(instrument.Expiry, now) {
+				return nil, fmt.Errorf("cannot place order on expired contract %s (expiry: %s)", request.Symbol, instrument.Expiry)
+			}
+		}
+	}
+
+	if request.Type == model.OrderTypeMarket {
+		// Reject before persisting when there is no safe executable price. This
+		// prevents a market order becoming an unfillable pending order.
+		redisStart := time.Now()
+		if _, err := s.executableQuote(request.Symbol); err != nil {
+			return nil, err
+		}
+		redisDuration = time.Since(redisStart)
+	}
+
+	initialStatus := model.OrderStatusPending
+	if request.Type == model.OrderTypeSL || request.Type == model.OrderTypeSLM {
+		initialStatus = model.OrderStatusTriggerPending
+	}
+
+	order := &model.Order{
+		UserUUID:          userUUID,
+		Symbol:            request.Symbol,
+		Side:              request.Side,
+		Type:              request.Type,
+		Product:           request.Product,
+		Quantity:          request.Quantity,
+		PricePaise:        request.PricePaise,
+		TriggerPricePaise: request.TriggerPricePaise,
+		Status:            initialStatus,
+		Reason:            request.Reason,
+	}
+
+	basePrice := request.PricePaise
+	if request.Type == model.OrderTypeSLM {
+		basePrice = request.TriggerPricePaise
+	}
+
+	reservation := int64(0)
+	if request.Product == model.OrderProductDelivery && request.Side == model.OrderSideBuy && request.Type != model.OrderTypeMarket {
+		if request.Quantity > 0 && basePathPrice(basePrice) > 0 && request.Quantity > int64(^uint64(0)>>1)/basePrice {
+			return nil, fmt.Errorf("order value is too large")
+		}
+		reservation = request.Quantity * basePathPrice(basePrice)
+	}
+	if request.Product != model.OrderProductDelivery && request.Type != model.OrderTypeMarket {
+		notional, ok := multiply(request.Quantity, basePathPrice(basePrice))
+		if !ok {
+			return nil, fmt.Errorf("order value is too large")
+		}
+		instrumentType := ""
+		if instrument != nil {
+			instrumentType, _ = product.ValidateFNOInstrument(*instrument, request.Quantity)
+		}
+		reservation, err = s.rules.Margin(request.Product, instrumentType, request.Side, notional)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if s.createOrderFunc != nil {
+		if err := s.createOrderFunc(order); err != nil {
+			return nil, err
+		}
+		return toResponse(order), nil
+	}
+
+	order.IntentKey, order.IntentHash = intentKey, intentHash
+	dbStart := time.Now()
+	if err := s.repo.CreateIntent(order, reservation); err != nil {
+		if errors.Is(err, gorm.ErrInvalidData) {
+			return nil, fmt.Errorf("insufficient available wallet balance")
+		}
+		return nil, err
+	}
+	dbDuration := time.Since(dbStart)
+
+	logger.Info("order created",
+		logger.OrderID(order.UUID.String()),
+		logger.UserID(userID),
+		zap.String("symbol", order.Symbol),
+		zap.String("side", order.Side),
+		zap.String("type", order.Type),
+		zap.String("product", order.Product),
+		zap.Int64("quantity", order.Quantity),
+		zap.Int64("price_paise", order.PricePaise),
+		zap.Int64("reserved_paise", reservation),
+		zap.String("status", order.Status),
+		logger.Latency(time.Since(createStart)),
+		logger.RedisLatency(redisDuration),
+		logger.DBLatency(dbDuration),
+	)
+
+	return s.finishCreated(userID, order)
+}
+
+func (s *OrderService) finishCreated(userID string, order *model.Order) (*dto.OrderResponse, error) {
+	if order.Status == model.OrderStatusExecuted || order.Status == model.OrderStatusRejected || order.Status == model.OrderStatusCancelled {
+		return toResponse(order), nil
+	}
+	if order.Type == model.OrderTypeMarket {
+		if err := s.Execute(userID, order.UUID.String()); err != nil {
+			// Another concurrent retry may have finished while this request waited.
+			if current, readErr := s.Get(userID, order.UUID.String()); readErr == nil && (current.Status == model.OrderStatusExecuted || current.Status == model.OrderStatusRejected || current.Status == model.OrderStatusCancelled) {
+				return current, nil
+			}
+			if rejectErr := s.repo.Reject(order.UserUUID, order.UUID); rejectErr != nil {
+				if current, readErr := s.Get(userID, order.UUID.String()); readErr == nil && current.Status == model.OrderStatusExecuted {
+					return current, nil
+				}
+				return nil, fmt.Errorf("market order execution failed: %w (could not mark rejected: %v)", err, rejectErr)
+			}
+			return s.Get(userID, order.UUID.String())
+		}
+		return s.Get(userID, order.UUID.String())
+	}
+	// RegisterActiveOrder replaces matching UUIDs; recovery never duplicates an order.
+	s.RegisterActiveOrder(*order)
+	if err := s.MatchSymbol(order.Symbol); err != nil {
+		return nil, err
+	}
+	return s.Get(userID, order.UUID.String())
+}
+
+func (s *OrderService) RegisterActiveSymbol(symbol string) {
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+	if sym == "" {
+		return
+	}
+	s.activeSymbolsMu.Lock()
+	defer s.activeSymbolsMu.Unlock()
+	if s.activeSymbols == nil {
+		s.activeSymbols = make(map[string]int)
+	}
+	s.activeSymbols[sym]++
+}
+
+func (s *OrderService) RegisterActiveOrder(order model.Order) {
+	sym := strings.ToUpper(strings.TrimSpace(order.Symbol))
+	if sym == "" {
+		return
+	}
+	s.activeSymbolsMu.Lock()
+	defer s.activeSymbolsMu.Unlock()
+	if s.activeSymbols == nil {
+		s.activeSymbols = make(map[string]int)
+	}
+	if s.activeOrders == nil {
+		s.activeOrders = make(map[string][]model.Order)
+	}
+	for i, existing := range s.activeOrders[sym] {
+		if order.UUID != uuid.Nil && existing.UUID == order.UUID {
+			s.activeOrders[sym][i] = order
+			return
+		}
+	}
+	s.activeSymbols[sym]++
+	s.activeOrders[sym] = append(s.activeOrders[sym], order)
+}
+
+func (s *OrderService) UnregisterActiveSymbol(symbol string) {
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+	if sym == "" {
+		return
+	}
+	s.activeSymbolsMu.Lock()
+	defer s.activeSymbolsMu.Unlock()
+	if s.activeSymbols != nil {
+		delete(s.activeSymbols, sym)
+	}
+	if s.activeOrders != nil {
+		delete(s.activeOrders, sym)
+	}
+}
+
+func (s *OrderService) HasActiveOrders(symbol string) bool {
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+	if sym == "" {
+		return false
+	}
+	s.activeSymbolsMu.RLock()
+	defer s.activeSymbolsMu.RUnlock()
+	if s.activeSymbols == nil {
+		return false
+	}
+	return s.activeSymbols[sym] > 0
+}
+
+func (s *OrderService) refreshActiveOrdersForSymbol(symbol string) {
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+	if sym == "" {
+		return
+	}
+	orders, err := s.repo.ListActiveOrders(sym)
+	s.activeSymbolsMu.Lock()
+	defer s.activeSymbolsMu.Unlock()
+	if err != nil || len(orders) == 0 {
+		if s.activeSymbols != nil {
+			delete(s.activeSymbols, sym)
+		}
+		if s.activeOrders != nil {
+			delete(s.activeOrders, sym)
+		}
+		return
+	}
+	if s.activeSymbols == nil {
+		s.activeSymbols = make(map[string]int)
+	}
+	if s.activeOrders == nil {
+		s.activeOrders = make(map[string][]model.Order)
+	}
+	s.activeSymbols[sym] = len(orders)
+	s.activeOrders[sym] = orders
+}
+
+func (s *OrderService) RebuildActiveSymbolsFromDB() error {
+	db := database.GetDB()
+	if db == nil {
+		return nil
+	}
+	var orders []model.Order
+	err := db.Model(&model.Order{}).
+		Where("status IN ?", []string{
+			model.OrderStatusPending,
+			model.OrderStatusOpen,
+			model.OrderStatusTriggerPending,
+		}).
+		Order("created_at ASC").
+		Find(&orders).Error
+	if err != nil {
+		return err
+	}
+
+	s.activeSymbolsMu.Lock()
+	defer s.activeSymbolsMu.Unlock()
+	s.activeSymbols = make(map[string]int)
+	s.activeOrders = make(map[string][]model.Order)
+	for _, order := range orders {
+		cleaned := strings.ToUpper(strings.TrimSpace(order.Symbol))
+		if cleaned != "" {
+			s.activeSymbols[cleaned]++
+			s.activeOrders[cleaned] = append(s.activeOrders[cleaned], order)
+		}
+	}
+	return nil
+}
+
+func basePathPrice(price int64) int64 {
+	if price <= 0 {
+		return 100
+	}
+	return price
+}
+
+func isSupportedProduct(product string) bool {
+	return product == model.OrderProductDelivery || product == model.OrderProductIntraday || product == model.OrderProductFNO
+}
+
+func resolveCircuitLimits(quote *marketDTO.QuoteResponse, product string) (lowerCircuit int64, upperCircuit int64) {
+	if quote != nil && quote.LowerCircuitPaise > 0 && quote.UpperCircuitPaise > 0 {
+		return quote.LowerCircuitPaise, quote.UpperCircuitPaise
+	}
+
+	return 0, 0
+
+}
+
+func calculateCircuitLimits(refPricePaise int64, product string) (lowerCircuit int64, upperCircuit int64) {
+	pct := int64(10)
+	if product == model.OrderProductFNO {
+		pct = 20
+	}
+	band := (refPricePaise * pct) / 100
+	lowerCircuit = refPricePaise - band
+	if lowerCircuit < 5 {
+		lowerCircuit = 5
+	}
+	upperCircuit = refPricePaise + band
+	return lowerCircuit, upperCircuit
+}
+
+// RunMatcher consumes quote notifications for the process lifetime. Limit
+// prices are never overwritten: Execute compares the fresh quote with the
+// stored PricePaise before settling.
+func (s *OrderService) RunMatcher(ctx context.Context) {
+	_ = s.RebuildActiveSymbolsFromDB()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		subscription := s.market.SubscribeQuotes(ctx)
+		channel := subscription.Channel()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = subscription.Close()
+				return
+			case <-ticker.C:
+				_ = s.RebuildActiveSymbolsFromDB()
+			case message, open := <-channel:
+				if !open {
+					_ = subscription.Close()
+					goto reconnect
+				}
+				var quote marketDTO.QuoteResponse
+				if err := json.Unmarshal([]byte(message.Payload), &quote); err != nil || quote.Symbol == "" {
+					continue
+				}
+				// A failed fill (e.g. insufficient funds or a concurrently cancelled
+				// order) only affects that order; future quote updates remain usable.
+				sym := strings.ToUpper(quote.Symbol)
+				_ = s.MatchSymbol(sym)
+				for _, a := range alias.GetAliases(sym) {
+					_ = s.MatchSymbol(a)
+				}
+				if strings.HasSuffix(sym, "-EQ") {
+					_ = s.MatchSymbol(strings.TrimSuffix(sym, "-EQ"))
+				} else {
+					_ = s.MatchSymbol(sym + "-EQ")
+				}
+				if canonical := alias.ResolveCanonicalSymbol(sym); canonical != "" && canonical != sym {
+					_ = s.MatchSymbol(canonical)
+				}
+			}
+		}
+
+	reconnect:
+		// Redis reconnects internally in the normal case; this handles a fully
+		// closed subscription without leaving limit orders permanently idle.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// MatchSymbol checks all active orders (OPEN, PENDING, TRIGGER_PENDING) against a fresh executable quote.
+// It is intentionally idempotent: Execute locks and revalidates every order.
+func (s *OrderService) MatchSymbol(symbol string) error {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return nil
+	}
+	if !s.HasActiveOrders(symbol) {
+		return nil
+	}
+	quote, err := s.executableQuote(symbol)
+	if err != nil {
+		return nil // a zero or stale tick must not trigger settlement
+	}
+
+	s.activeSymbolsMu.RLock()
+	cachedOrders, hasCached := s.activeOrders[symbol]
+	s.activeSymbolsMu.RUnlock()
+
+	// If we have cached orders in memory, do an ultra-fast check to see if ANY order can trigger/fill.
+	// This prevents hammering remote Neon DB with 3-second queries on every incoming tick!
+	if hasCached && len(cachedOrders) > 0 {
+		hasActionable := false
+		for _, order := range cachedOrders {
+			if order.Status == model.OrderStatusTriggerPending {
+				if (order.Side == model.OrderSideBuy && quote.PricePaise >= order.TriggerPricePaise) ||
+					(order.Side == model.OrderSideSell && quote.PricePaise <= order.TriggerPricePaise) {
+					hasActionable = true
+					break
+				}
+			} else if order.Status == model.OrderStatusOpen || order.Status == model.OrderStatusPending {
+				if order.Type == model.OrderTypeMarket || order.Type == model.OrderTypeSLM || limitSatisfied(&order, quote.PricePaise) {
+					hasActionable = true
+					break
+				}
+			}
+		}
+		if !hasActionable {
+			return nil
+		}
+	}
+
+	orders, err := s.repo.ListActiveOrders(symbol)
+	if err != nil {
+		return err
+	}
+	if len(orders) == 0 {
+		s.UnregisterActiveSymbol(symbol)
+		return nil
+	}
+
+	executedAny := false
+	for _, order := range orders {
+		if order.Status == model.OrderStatusTriggerPending {
+			isTriggered := false
+			if order.Side == model.OrderSideBuy && quote.PricePaise >= order.TriggerPricePaise {
+				isTriggered = true
+			} else if order.Side == model.OrderSideSell && quote.PricePaise <= order.TriggerPricePaise {
+				isTriggered = true
+			}
+
+			if isTriggered {
+				if err := s.activateStop(order.UserUUID, order.UUID, quote.PricePaise); err != nil {
+					return err
+				}
+				_ = s.Execute(order.UserUUID.String(), order.UUID.String())
+				// Activation itself changes matcher state even without a fill.
+				executedAny = true
+			}
+		} else if order.Status == model.OrderStatusOpen || order.Status == model.OrderStatusPending {
+			if order.Type == model.OrderTypeMarket || order.Type == model.OrderTypeSLM || limitSatisfied(&order, quote.PricePaise) {
+				_ = s.Execute(order.UserUUID.String(), order.UUID.String())
+				executedAny = true
+			}
+		}
+	}
+
+	if executedAny {
+		s.refreshActiveOrdersForSymbol(symbol)
+	} else {
+		s.activeSymbolsMu.Lock()
+		if s.activeOrders == nil {
+			s.activeOrders = make(map[string][]model.Order)
+		}
+		s.activeOrders[symbol] = orders
+		s.activeSymbolsMu.Unlock()
+	}
+
+	return nil
+}
+
+func (s *OrderService) List(userID string) ([]dto.OrderResponse, error) {
+	userUUID, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user identity")
+	}
+	orders, err := s.repo.List(userUUID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]dto.OrderResponse, 0, len(orders))
+	for _, order := range orders {
+		result = append(result, *toResponse(&order))
+	}
+	return result, nil
+}
+
+func (s *OrderService) Get(userID, orderID string) (*dto.OrderResponse, error) {
+	userUUID, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user identity")
+	}
+	orderUUID, err := uuid.Parse(orderID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid order identity")
+	}
+	order, err := s.repo.FindByUUID(userUUID, orderUUID)
+	if err != nil {
+		return nil, err
+	}
+	return toResponse(order), nil
+}
+
+func (s *OrderService) Cancel(userID, orderID string) error {
+	userUUID, err := uuid.Parse(userID)
+	if err != nil {
+		return fmt.Errorf("invalid user identity")
+	}
+
+	orderUUID, err := uuid.Parse(orderID)
+	if err != nil {
+		return fmt.Errorf("invalid order identity")
+	}
+
+	existing, _ := s.repo.FindByUUID(userUUID, orderUUID)
+
+	if err := s.repo.Cancel(userUUID, orderUUID); err != nil {
+		return err
+	}
+
+	if existing != nil {
+		s.refreshActiveOrdersForSymbol(existing.Symbol)
+	}
+	return nil
+}
+
+func (s *OrderService) ClearHistory(userID string) (int64, error) {
+	userUUID, err := uuid.Parse(userID)
+	if err != nil {
+		return 0, fmt.Errorf("invalid user identity")
+	}
+	return s.repo.ClearHistory(userUUID)
+}
+
+func toResponse(order *model.Order) *dto.OrderResponse {
+	return &dto.OrderResponse{
+		UUID:               order.UUID.String(),
+		Symbol:             order.Symbol,
+		Side:               order.Side,
+		Type:               order.Type,
+		Product:            order.Product,
+		Quantity:           order.Quantity,
+		PricePaise:         order.PricePaise,
+		TriggerPricePaise:  order.TriggerPricePaise,
+		ExecutedPricePaise: order.ExecutedPricePaise,
+		ReservedPaise:      order.ReservedPaise,
+		Status:             order.Status,
+		CreatedAt:          order.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt:          order.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+	}
+}
