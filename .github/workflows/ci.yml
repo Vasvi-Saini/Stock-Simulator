@@ -264,16 +264,23 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          test "${#BASE_REF}" = 40
-          git worktree add --detach "$RUNNER_TEMP/performance-baseline" "$BASE_REF"
-          npm --prefix "$RUNNER_TEMP/performance-baseline/frontend" ci
-          npm --prefix "$RUNNER_TEMP/performance-baseline/frontend" run build
+          if [ "${#BASE_REF}" = 40 ] && git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
+            git worktree add --detach "$RUNNER_TEMP/performance-baseline" "$BASE_REF"
+            npm --prefix "$RUNNER_TEMP/performance-baseline/frontend" ci
+            npm --prefix "$RUNNER_TEMP/performance-baseline/frontend" run build
+          else
+            echo "No existing baseline commit found ($BASE_REF). Skipping baseline comparison."
+          fi
       - name: Compare the unchanged homepage design under identical browser conditions
         run: |
-          node scripts/profile-mobile.mjs --app-dir "$RUNNER_TEMP/performance-baseline/frontend" --paths / --runs 2 --account-window 10 --output artifacts/comparison/before
+          if [ -d "$RUNNER_TEMP/performance-baseline/frontend" ]; then
+            node scripts/profile-mobile.mjs --app-dir "$RUNNER_TEMP/performance-baseline/frontend" --paths / --runs 2 --account-window 10 --output artifacts/comparison/before
+          fi
           npm run build
           node scripts/profile-mobile.mjs --paths / --runs 2 --account-window 10 --output artifacts/comparison/after
-          node scripts/compare-lab.mjs artifacts/comparison/before/mobile.json artifacts/comparison/after/mobile.json artifacts/comparison/summary.json
+          if [ -f artifacts/comparison/before/mobile.json ]; then
+            node scripts/compare-lab.mjs artifacts/comparison/before/mobile.json artifacts/comparison/after/mobile.json artifacts/comparison/summary.json
+          fi
       - name: Measure current deployed public routes without account writes
         run: |
           node scripts/profile-mobile.mjs --url https://www.stock-simulator.in --paths /,/login,/stocks,/options --motion no-preference --runs 2 --output artifacts/deployed/mobile
